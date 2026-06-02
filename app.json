@@ -1,0 +1,18 @@
+{
+  "expo": {
+    "name": "6mobile",
+    "slug": "6mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": false
+    },
+    "android": {
+      "predictiveBackGestureEnabled": false
+    },
+    "plugins": [
+      "expo-audio"
+    ]
+  }
+}
