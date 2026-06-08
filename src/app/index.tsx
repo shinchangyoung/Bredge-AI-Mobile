@@ -1,5 +1,5 @@
 import MaterialIcons from '@expo/vector-icons/MaterialIcons';
-import { useRouter } from 'expo-router';
+import { useRouter, useFocusEffect } from 'expo-router';
 import LottieView from 'lottie-react-native';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
@@ -13,6 +13,7 @@ import {
   TextInput,
   useWindowDimensions,
   View,
+  DeviceEventEmitter,
 } from 'react-native';
 
 import { FontFamily } from '@/constants/fonts';
@@ -76,8 +77,18 @@ export default function HomeScreen() {
     }
   }, []);
 
+  useFocusEffect(
+    useCallback(() => {
+      loadRecentFiles();
+    }, [loadRecentFiles])
+  );
+
   useEffect(() => {
-    loadRecentFiles();
+    const subscription = DeviceEventEmitter.addListener('globalRefresh', () => {
+      loadRecentFiles();
+    });
+    
+    return () => subscription.remove();
   }, [loadRecentFiles]);
 
   return (
@@ -86,22 +97,27 @@ export default function HomeScreen() {
         <View style={[styles.railWrap, { width: layout.railWidth }]}>
           <View style={styles.rail}>
             <View style={styles.railTop}>
-              <Image
-                source={require('@/assets/groupchat/logo.png')}
-                style={[
-                  styles.logo,
-                  {
-                    width: layout.railWidth * 0.64,
-                    height: layout.railWidth * 0.64,
-                    borderRadius: layout.railWidth * 0.32,
-                  },
-                ]}
-              />
+              <Pressable onPress={() => {
+                DeviceEventEmitter.emit('globalRefresh');
+                router.push('/');
+              }}>
+                <Image
+                  source={require('@/assets/groupchat/logo.png')}
+                  style={[
+                    styles.logo,
+                    {
+                      width: layout.railWidth * 0.64,
+                      height: layout.railWidth * 0.64,
+                      borderRadius: layout.railWidth * 0.32,
+                    },
+                  ]}
+                />
+              </Pressable>
 
               <View style={styles.railNav}>
                 <RailButton name="add" onPress={() => router.push('/workspace')} />
                 <RailButton name="folder-open" onPress={() => router.push('/workfolder')} />
-                <RailButton name="calendar-today" />
+                <RailButton name="calendar-today" onPress={() => router.push('/calendar')} />
               </View>
             </View>
           </View>
