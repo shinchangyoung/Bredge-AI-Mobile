@@ -240,6 +240,26 @@ export async function deleteWorkspaceRecordingData(sessionId: string, recordingI
   }>;
 }
 
+export async function createWorkspaceSession(data: {
+  course_id?: string | null;
+  title: string;
+  file_kind?: string;
+  tag?: string;
+  color?: string;
+}) {
+  return requestWorkspaceJson('sessions', '세션 파일을 생성하지 못했습니다.', {
+    body: JSON.stringify(data),
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    method: 'POST',
+  }) as Promise<{
+    ok: boolean;
+    node: WorkspaceSessionNode;
+  }>;
+}
+
+
 export function getWorkspaceAssetUrl(path?: string | null) {
   if (!path) return undefined;
   if (/^(file|blob):/i.test(path)) return path;

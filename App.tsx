@@ -3,6 +3,7 @@ import type { ReactNode } from 'react';
 import * as DocumentPicker from 'expo-document-picker';
 import type { DocumentPickerAsset } from 'expo-document-picker';
 import {
+  createAudioPlayer,
   RecordingPresets,
   requestRecordingPermissionsAsync,
   setAudioModeAsync,
@@ -18,6 +19,7 @@ import { StatusBar } from 'expo-status-bar';
 import LottieView from 'lottie-react-native';
 import { WebView } from 'react-native-webview';
 import {
+  Alert,
   Animated,
   Easing,
   Image,
@@ -34,6 +36,7 @@ import {
 } from 'react-native';
 
 import {
+  createWorkspaceSession,
   deleteWorkspaceRecordingData,
   getWorkspaceAssetUrl,
   getWorkspaceApiBaseUrl,
@@ -700,6 +703,15 @@ export default function App() {
   const [voiceSaveSourceId, setVoiceSaveSourceId] = useState<string | null>(null);
   const [voiceSaveError, setVoiceSaveError] = useState<string | null>(null);
   const [savingVoiceSourceId, setSavingVoiceSourceId] = useState<string | null>(null);
+  const [draftFolderId, setDraftFolderId] = useState<string | null>(null);
+  const [saveCompletionNotification, setSaveCompletionNotification] = useState<{
+    sessionId: string;
+    sessionTitle: string;
+  } | null>(null);
+  const [pendingUploadAsset, setPendingUploadAsset] = useState<DocumentPickerAsset | null>(null);
+  const [isUploadDestinationModalVisible, setIsUploadDestinationModalVisible] = useState(false);
+  const [uploadDestinationError, setUploadDestinationError] = useState<string | null>(null);
+  const [isUploadingToDestination, setIsUploadingToDestination] = useState(false);
   const [draftSessionTitle, setDraftSessionTitle] = useState('');
   const [draftSessionTag, setDraftSessionTag] = useState(fileTags[0]);
   const [draftSessionColor, setDraftSessionColor] = useState(fileColors[0]);
@@ -1031,6 +1043,14 @@ export default function App() {
 
       recordingSessionIdRef.current = null;
       await setAudioModeAsync({ allowsRecording: false });
+
+      try {
+        // 녹음 종료음 재생 (마이크 해제 후 재생하여 음질 동일하게 유지)
+        const stopSoundPlayer = createAudioPlayer('https://actions.google.com/sounds/v1/alarms/beep_short.ogg');
+        stopSoundPlayer.play();
+      } catch (e) {
+        console.warn('Failed to play stop sound', e);
+      }
     } catch (error) {
       recordingStartedAtRef.current = null;
       recordingAccumulatedMillisRef.current = 0;
@@ -1106,6 +1126,15 @@ export default function App() {
         return;
       }
 
+      try {
+        // 녹음 시작음 재생 (마이크 활성화 전 일반 모드에서 재생하여 종료음과 음질 동일하게 유지)
+        const startSoundPlayer = createAudioPlayer('https://actions.google.com/sounds/v1/alarms/beep_short.ogg');
+        startSoundPlayer.play();
+        await new Promise((resolve) => setTimeout(resolve, 250)); // 효과음이 짤리지 않도록 아주 잠시 대기
+      } catch (e) {
+        console.warn('Failed to play start sound', e);
+      }
+
       await setAudioModeAsync({
         allowsRecording: true,
         playsInSilentMode: true,
@@ -1133,6 +1162,7 @@ export default function App() {
     setDraftSessionColor(fileColors[0]);
     setDraftCustomTag('');
     setIsCustomTagInputOpen(false);
+    setDraftFolderId(null);
     setCreateModalVisible(true);
   };
 
@@ -1147,25 +1177,42 @@ export default function App() {
     setDraftSessionTag(tag.trim() || fileTags[0]);
   };
 
-  const createDemoSession = () => {
+  const createDemoSession = async () => {
     const title = draftSessionTitle.trim();
     if (!title) {
       return;
     }
 
     const tag = draftSessionTag.trim() || fileTags[0];
-    const nextSession: SessionFile = {
-      audioSources: [],
-      color: draftSessionColor,
-      date: formatDemoDate(new Date()),
-      id: `demo-session-${Date.now()}`,
-      tag,
-      title,
-    };
+    const color = draftSessionColor;
 
-    setSessions((currentSessions) => [nextSession, ...currentSessions]);
-    openSession(nextSession.id);
-    setCreateModalVisible(false);
+    try {
+      setWorkspaceStatus('loading');
+      const response = await createWorkspaceSession({
+        course_id: draftFolderId,
+        title,
+        tag,
+        color,
+        file_kind: 'lecture',
+      });
+
+      if (response.ok && response.node) {
+        const nextSession = workspaceFileToSession(response.node);
+
+        setSessions((currentSessions) => [nextSession, ...currentSessions]);
+
+        const nextTree = await getWorkspaceTree();
+        setWorkspaceTree(nextTree);
+
+        openSession(nextSession.id);
+        setCreateModalVisible(false);
+      }
+    } catch (error) {
+      console.error(error);
+      Alert.alert('오류', error instanceof Error ? error.message : '세션 파일을 생성하지 못했습니다.');
+    } finally {
+      setWorkspaceStatus('connected');
+    }
   };
 
   const openSavedVoiceSourceTab = () => {
@@ -1249,13 +1296,31 @@ export default function App() {
       if (selectedSessionId) {
         await addUploadedVoiceToSession(asset, selectedSessionId);
       } else {
-        addUploadedVoiceSource(asset);
+        setPendingUploadAsset(asset);
+        setUploadDestinationError(null);
+        setIsUploadDestinationModalVisible(true);
       }
     } catch (error) {
       setQuickActionError(error instanceof Error ? error.message : '음성소스를 업로드하지 못했습니다.');
       setQuickActionMenuVisible(true);
     } finally {
       setIsPickingVoiceFile(false);
+    }
+  };
+
+  const handleUploadToSession = async (sessionId: string) => {
+    if (!pendingUploadAsset) return;
+    try {
+      setIsUploadingToDestination(true);
+      setUploadDestinationError(null);
+      await addUploadedVoiceToSession(pendingUploadAsset, sessionId);
+      setIsUploadDestinationModalVisible(false);
+      setPendingUploadAsset(null);
+      openSession(sessionId);
+    } catch (error) {
+      setUploadDestinationError(error instanceof Error ? error.message : '음성파일을 세션에 업로드하지 못했습니다.');
+    } finally {
+      setIsUploadingToDestination(false);
     }
   };
 
@@ -1461,6 +1526,10 @@ export default function App() {
 
       setVoiceSources((currentSources) => currentSources.filter((currentSource) => currentSource.id !== sourceId));
       setVoiceSaveSourceId(null);
+      setSaveCompletionNotification({
+        sessionId,
+        sessionTitle: targetSession.title,
+      });
       return true;
     } catch (error) {
       setVoiceSaveError(error instanceof Error ? error.message : '음성소스를 세션 파일에 저장하지 못했습니다.');
@@ -1607,6 +1676,21 @@ export default function App() {
             tagOptions={workspaceTagOptions}
             title={draftSessionTitle}
             visible={createModalVisible}
+            tree={workspaceTree}
+            selectedFolderId={draftFolderId}
+            onSelectFolder={setDraftFolderId}
+          />
+
+          <VoiceSaveCompletionModal
+            visible={Boolean(saveCompletionNotification)}
+            sessionTitle={saveCompletionNotification?.sessionTitle ?? ''}
+            onClose={() => setSaveCompletionNotification(null)}
+            onMove={() => {
+              if (saveCompletionNotification) {
+                openSession(saveCompletionNotification.sessionId);
+                setSaveCompletionNotification(null);
+              }
+            }}
           />
 
           <VoiceSourceSavedPrompt
@@ -1660,6 +1744,21 @@ export default function App() {
             source={selectedVoiceSaveSource}
             tree={workspaceTree}
             visible={Boolean(voiceSaveSourceId)}
+          />
+
+          <UploadDestinationModal
+            error={uploadDestinationError}
+            isSaving={isUploadingToDestination}
+            onClose={() => {
+              setIsUploadDestinationModalVisible(false);
+              setPendingUploadAsset(null);
+              setUploadDestinationError(null);
+            }}
+            onSelectSession={(sessionId) => {
+              void handleUploadToSession(sessionId);
+            }}
+            tree={workspaceTree}
+            visible={isUploadDestinationModalVisible}
           />
 
           <ResourceActionMenu
@@ -3012,6 +3111,112 @@ function VoiceSourceCard({
   );
 }
 
+function UploadDestinationModal({
+  error,
+  isSaving,
+  onClose,
+  onSelectSession,
+  tree,
+  visible,
+}: {
+  error: string | null;
+  isSaving: boolean;
+  onClose: () => void;
+  onSelectSession: (sessionId: string) => void;
+  tree: WorkspaceNode[];
+  visible: boolean;
+}) {
+  const hasDestinations = tree.length > 0;
+
+  return (
+    <Modal animationType="fade" transparent visible={visible} onRequestClose={onClose}>
+      <View style={styles.voiceSaveLayer}>
+        <Pressable accessibilityLabel="업로드 위치 닫기" onPress={onClose} style={styles.voiceSaveBackdrop} />
+
+        <View style={styles.voiceSaveCard}>
+          <View style={styles.voiceSaveHeader}>
+            <View style={styles.voiceSaveHeaderText}>
+              <Text style={styles.voiceSaveTitle}>업로드할 세션 선택</Text>
+              <Text numberOfLines={1} style={styles.voiceSaveDescription}>
+                음성소스를 업로드할 세션 파일을 선택해주세요.
+              </Text>
+            </View>
+
+            <Pressable disabled={isSaving} onPress={onClose} style={styles.voiceSaveCloseButton}>
+              <Text style={styles.voiceSaveCloseText}>×</Text>
+            </Pressable>
+          </View>
+
+          <ScrollView
+            bounces={false}
+            contentContainerStyle={[styles.voiceSaveList, styles.folderTreeList]}
+            showsVerticalScrollIndicator={false}>
+            {tree.map((node) => (
+              <VoiceSaveTreeNode
+                depth={0}
+                disabled={isSaving}
+                key={`${node.type}-${node.id}`}
+                node={node}
+                onSelectSession={onSelectSession}
+              />
+            ))}
+
+            {!hasDestinations && <Text style={styles.voiceSaveEmptyText}>업로드할 세션 파일이 없습니다.</Text>}
+          </ScrollView>
+
+          {error && <Text style={styles.voiceSaveErrorText}>{error}</Text>}
+          {isSaving && <Text style={styles.voiceSaveSavingText}>업로드 중...</Text>}
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+function VoiceSaveCompletionModal({
+  visible,
+  sessionTitle,
+  onClose,
+  onMove,
+}: {
+  visible: boolean;
+  sessionTitle: string;
+  onClose: () => void;
+  onMove: () => void;
+}) {
+  return (
+    <Modal animationType="fade" transparent visible={visible} onRequestClose={onClose}>
+      <View style={styles.voicePromptLayer}>
+        <Pressable accessibilityLabel="음성소스 저장 완료 닫기" onPress={onClose} style={styles.voicePromptBackdrop} />
+
+        <View style={styles.voicePromptCard}>
+          <Pressable accessibilityLabel="음성소스 저장 완료 닫기" onPress={onClose} style={styles.voicePromptCloseButton}>
+            <Text style={styles.voicePromptCloseText}>×</Text>
+          </Pressable>
+
+          <View style={styles.voicePromptIconBox}>
+            <SourceVoiceIcon />
+          </View>
+
+          <Text style={styles.voicePromptTitle}>{sessionTitle}에 저장되었습니다.</Text>
+          <Text style={styles.voicePromptDescription}>
+            저장된 세션 파일 상세 페이지에서 녹음본과 요약을 확인하실 수 있습니다.
+          </Text>
+
+          <View style={styles.voicePromptActions}>
+            <Pressable onPress={onClose} style={styles.voicePromptCancelButton}>
+              <Text style={styles.voicePromptCancelText}>취소</Text>
+            </Pressable>
+
+            <Pressable onPress={onMove} style={styles.voicePromptMoveButtonFlex}>
+              <Text style={styles.voicePromptMoveText}>이동하기</Text>
+            </Pressable>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
 function VoiceSourceSavedPrompt({
   onClose,
   onMove,
@@ -3038,9 +3243,15 @@ function VoiceSourceSavedPrompt({
           <Text style={styles.voicePromptTitle}>음성소스가 저장되었습니다.</Text>
           <Text style={styles.voicePromptDescription}>파일이 지정되지 않은 녹음은 음성소스 탭에서 확인할 수 있어요.</Text>
 
-          <Pressable onPress={onMove} style={styles.voicePromptMoveButton}>
-            <Text style={styles.voicePromptMoveText}>이동하기</Text>
-          </Pressable>
+          <View style={styles.voicePromptActions}>
+            <Pressable onPress={onClose} style={styles.voicePromptCancelButton}>
+              <Text style={styles.voicePromptCancelText}>취소</Text>
+            </Pressable>
+
+            <Pressable onPress={onMove} style={styles.voicePromptMoveButtonFlex}>
+              <Text style={styles.voicePromptMoveText}>이동하기</Text>
+            </Pressable>
+          </View>
         </View>
       </View>
     </Modal>
@@ -3112,9 +3323,7 @@ function VoiceSaveDestinationModal({
   tree: WorkspaceNode[];
   visible: boolean;
 }) {
-  const workspaceSessionIds = collectWorkspaceSessionIds(tree);
-  const localSessions = sessions.filter((session) => !workspaceSessionIds.has(session.id));
-  const hasDestinations = tree.length > 0 || localSessions.length > 0;
+  const hasDestinations = tree.length > 0;
 
   return (
     <Modal animationType="fade" transparent visible={visible && Boolean(source)} onRequestClose={onClose}>
@@ -3148,14 +3357,6 @@ function VoiceSaveDestinationModal({
                 onSelectSession={onSelectSession}
               />
             ))}
-
-            {localSessions.length > 0 && (
-              <VoiceSaveLocalSessionGroup
-                disabled={isSaving}
-                onSelectSession={onSelectSession}
-                sessions={localSessions}
-              />
-            )}
 
             {!hasDestinations && <Text style={styles.voiceSaveEmptyText}>저장할 세션 파일이 없습니다.</Text>}
           </ScrollView>
@@ -3351,6 +3552,20 @@ function VoiceSaveLocalSessionGroup({
   );
 }
 
+function getFoldersFromTree(tree: WorkspaceNode[]): { id: string; name: string }[] {
+  const folders: { id: string; name: string }[] = [];
+  const visit = (nodes: WorkspaceNode[] = []) => {
+    nodes.forEach((node) => {
+      if (node.type === 'folder') {
+        folders.push({ id: node.id, name: node.name });
+        visit(node.children ?? []);
+      }
+    });
+  };
+  visit(tree);
+  return folders;
+}
+
 function CreateSessionModal({
   customTagValue,
   isCustomTagInputOpen,
@@ -3366,6 +3581,9 @@ function CreateSessionModal({
   tagOptions,
   title,
   visible,
+  tree,
+  selectedFolderId,
+  onSelectFolder,
 }: {
   customTagValue: string;
   isCustomTagInputOpen: boolean;
@@ -3381,8 +3599,12 @@ function CreateSessionModal({
   tagOptions: string[];
   title: string;
   visible: boolean;
+  tree: WorkspaceNode[];
+  selectedFolderId: string | null;
+  onSelectFolder: (folderId: string | null) => void;
 }) {
   const canCreate = title.trim().length > 0;
+  const folders = getFoldersFromTree(tree);
 
   return (
     <Modal animationType="fade" transparent visible={visible} onRequestClose={onCancel}>
@@ -3445,6 +3667,35 @@ function CreateSessionModal({
             ))}
           </View>
 
+          <Text style={styles.createSectionLabel}>저장할 폴더</Text>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.createFolderRow}>
+            <Pressable
+              onPress={() => onSelectFolder(null)}
+              style={[
+                styles.createFolderChoice,
+                selectedFolderId === null && styles.createFolderChoiceSelected,
+              ]}>
+              <Text style={[
+                styles.createFolderText,
+                selectedFolderId === null && styles.createFolderTextSelected,
+              ]}>기본폴더</Text>
+            </Pressable>
+            {folders.map((folder) => (
+              <Pressable
+                key={folder.id}
+                onPress={() => onSelectFolder(folder.id)}
+                style={[
+                  styles.createFolderChoice,
+                  selectedFolderId === folder.id && styles.createFolderChoiceSelected,
+                ]}>
+                <Text style={[
+                  styles.createFolderText,
+                  selectedFolderId === folder.id && styles.createFolderTextSelected,
+                ]}>{folder.name}</Text>
+              </Pressable>
+            ))}
+          </ScrollView>
+
           <View style={styles.createModalActions}>
             <Pressable onPress={onCancel} style={styles.createModalCancelButton}>
               <Text style={styles.createModalCancelText}>취소</Text>
@@ -3499,6 +3750,7 @@ function RecordingBottomSheet({
   const expandedY = 6;
   const collapsedY = Math.max(height - 430, 220);
   const hiddenY = height + 24;
+
 
   const snapTo = (nextY: number, expanded: boolean, closeWhenDone = false) => {
     setIsExpanded(expanded);
@@ -3615,7 +3867,12 @@ function RecordingBottomSheet({
         </View>
 
         <View style={[styles.sheetWavePanel, isExpanded && styles.sheetWavePanelExpanded]}>
-          <Waveform expanded={isExpanded} inputLevel={inputLevel} isRecording={isRecording} />
+          <Waveform
+            expanded={isExpanded}
+            inputLevel={inputLevel}
+            isRecording={isRecording}
+            metering={recorderState.metering}
+          />
         </View>
 
         <View style={[styles.sheetSimpleControls, isExpanded && styles.sheetSimpleControlsExpanded]}>
@@ -3642,64 +3899,34 @@ function Waveform({
   expanded,
   inputLevel,
   isRecording,
+  metering,
 }: {
   expanded: boolean;
   inputLevel: number;
   isRecording: boolean;
+  metering?: number;
 }) {
-  const phase = useRef(new Animated.Value(0)).current;
-  const baseBars = expanded ? waveformBars : waveformBars.slice(0, 64);
-  const energy = isRecording ? inputLevel : 0.26;
-  const maxBarHeight = expanded ? 84 : 52;
-  const minBarHeight = expanded ? 12 : 8;
-
-  useEffect(() => {
-    phase.setValue(0);
-    const pulseAnimation = Animated.loop(
-      Animated.timing(phase, {
-        duration: isRecording ? 760 : 1800,
-        easing: Easing.inOut(Easing.sin),
-        toValue: 1,
-        useNativeDriver: true,
-      }),
-    );
-
-    pulseAnimation.start();
-    return () => pulseAnimation.stop();
-  }, [isRecording, phase]);
+  // 무음 기준 데시벨(dB)을 -30dB로 고정합니다.
+  const isSilent = isRecording && metering !== undefined && metering < -30;
+  const isPlaying = isRecording && !isSilent;
+  
+  // 기본 시작 속도를 없애고 inputLevel에 비례하여 부드럽게 움직이도록 수정합니다.
+  const speed = isPlaying ? inputLevel * 1.8 : 0;
 
   return (
     <View style={[styles.waveform, expanded && styles.waveformExpanded]}>
-      <Animated.View style={styles.waveformTrack}>
-        {baseBars.map((barIndex, renderedIndex) => {
-          const localIndex = renderedIndex;
-          const shape = 0.28 + (((barIndex * 7) % 17) / 17) * 0.72;
-          const centerBias = 1 - Math.abs(localIndex - baseBars.length / 2) / baseBars.length;
-          const height = minBarHeight + maxBarHeight * energy * (0.42 + shape * 0.44 + centerBias * 0.18);
-          const pulse = phase.interpolate({
-            inputRange: [0, 0.5, 1],
-            outputRange: [
-              0.74 + ((barIndex * 3) % 7) * 0.025,
-              1.08 + ((barIndex * 5) % 9) * 0.018,
-              0.82 + ((barIndex * 2) % 6) * 0.02,
-            ],
-          });
-
-          return (
-            <Animated.View
-              key={`waveform-${renderedIndex}`}
-              style={[
-                styles.waveformBar,
-                {
-                  height,
-                  opacity: isRecording ? 0.92 : 0.38,
-                  transform: [{ scaleY: pulse }],
-                },
-              ]}
-            />
-          );
-        })}
-      </Animated.View>
+      <LottieView
+        autoPlay={isPlaying}
+        loop
+        resizeMode="contain"
+        source={require('./assets/groupchat/animations/soundwave.json')}
+        speed={speed}
+        style={{
+          width: expanded ? 320 : 220,
+          height: expanded ? 137 : 94,
+          alignSelf: 'center',
+        }}
+      />
     </View>
   );
 }
@@ -5120,6 +5347,33 @@ const styles = StyleSheet.create({
     fontWeight: '900',
     lineHeight: 20,
   },
+  voicePromptActions: {
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 18,
+    width: '100%',
+  },
+  voicePromptCancelButton: {
+    alignItems: 'center',
+    backgroundColor: '#F1F4F8',
+    borderRadius: 18,
+    flex: 1,
+    height: 44,
+    justifyContent: 'center',
+  },
+  voicePromptCancelText: {
+    color: '#6B7280',
+    fontSize: 15,
+    fontWeight: '900',
+  },
+  voicePromptMoveButtonFlex: {
+    alignItems: 'center',
+    backgroundColor: '#101114',
+    borderRadius: 18,
+    flex: 1,
+    height: 44,
+    justifyContent: 'center',
+  },
   voiceSaveLayer: {
     alignItems: 'center',
     backgroundColor: 'rgba(16,18,22,0.34)',
@@ -5781,6 +6035,34 @@ const styles = StyleSheet.create({
     height: 26,
     width: 26,
   },
+  createFolderRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 6,
+    paddingVertical: 4,
+  },
+  createFolderChoice: {
+    alignItems: 'center',
+    backgroundColor: '#F2F4F8',
+    borderColor: '#E5E8EF',
+    borderRadius: 999,
+    borderWidth: 1,
+    height: 36,
+    justifyContent: 'center',
+    paddingHorizontal: 14,
+  },
+  createFolderChoiceSelected: {
+    backgroundColor: '#101114',
+    borderColor: '#101114',
+  },
+  createFolderText: {
+    color: '#626975',
+    fontSize: 13,
+    fontWeight: '900',
+  },
+  createFolderTextSelected: {
+    color: '#FFFFFF',
+  },
   createModalActions: {
     flexDirection: 'row',
     gap: 10,
@@ -5943,14 +6225,14 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     alignSelf: 'center',
     flexDirection: 'row',
-    gap: 4,
+    gap: 2.5,
     justifyContent: 'center',
     paddingHorizontal: 8,
   },
   waveformBar: {
-    backgroundColor: '#F59E0B',
+    backgroundColor: '#3b82f6',
     borderRadius: 999,
-    width: 3,
+    width: 2.2,
   },
   sheetStopSquare: {
     backgroundColor: '#FF414B',
