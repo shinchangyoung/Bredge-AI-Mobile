@@ -1811,7 +1811,7 @@ export default function App() {
 
   const hasRecordingSession = isRecordingActive || isRecordingPaused || recorderState.isRecording;
   const shouldShowBottomActions =
-    !recordingSheetVisible && (!selectedMaterialSource || hasRecordingSession);
+    !recordingSheetVisible && (!selectedMaterialSource || hasRecordingSession) && (activeTab !== '캘린더' || hasRecordingSession);
 
   return (
     <View style={styles.appRoot}>
@@ -2123,7 +2123,10 @@ function HomeScreen({
     .map((sessionId) => sessions.find((session) => session.id === sessionId))
     .filter((session): session is SessionFile => Boolean(session));
   const fallbackSessions = sessions.filter((session) => !recentSessionIds.includes(session.id));
-  const recentSessions = [...openedRecentSessions, ...fallbackSessions].slice(0, 3);
+  const recentSessions = [...openedRecentSessions, ...fallbackSessions].slice(0, 2);
+
+  const upcomingSchedule = calendarSchedules[0];
+  const pendingSchedule = calendarSchedules.find((s) => s.status === 'pending' && s.id !== upcomingSchedule?.id);
 
   return (
     <>
@@ -2156,6 +2159,84 @@ function HomeScreen({
             <>
               <WelcomeAnimation />
               <WorkspaceStatusBanner error={workspaceError} status={workspaceStatus} />
+
+              {upcomingSchedule && (
+                <View style={{ marginBottom: pendingSchedule ? 14 : 14 }}>
+                  <Text style={{
+                    fontSize: 13,
+                    fontWeight: '900',
+                    color: '#8A8F98',
+                    marginBottom: 8,
+                    marginLeft: 6
+                  }}>다가오는 일정</Text>
+                  <Pressable 
+                    onPress={() => {
+                      onChangeTab('캘린더');
+                      setTimeout(() => {
+                        DeviceEventEmitter.emit('goToCalendarDate', upcomingSchedule.dateKey);
+                      }, 50);
+                    }}
+                    style={{
+                      flexDirection: 'row',
+                      alignItems: 'center',
+                      backgroundColor: '#FFFFFF',
+                      borderColor: '#E3E7EF',
+                      borderWidth: 1,
+                      borderRadius: 30,
+                      paddingHorizontal: 20,
+                      paddingVertical: 16,
+                    }}>
+                    <Text style={{ color: upcomingSchedule.status === 'pending' ? '#F97316' : '#355CFF', fontWeight: '900', fontSize: 15, marginRight: 14 }}>
+                      {upcomingSchedule.dateKey.slice(5).replace('-', '.')}
+                    </Text>
+                    <Text style={{ flex: 1, color: '#111318', fontWeight: '800', fontSize: 15 }} numberOfLines={1}>
+                      {upcomingSchedule.title}
+                    </Text>
+                    <Text style={{ color: upcomingSchedule.status === 'pending' ? '#F97316' : '#8A8F98', fontWeight: '700', fontSize: 13, marginLeft: 10 }}>
+                      {upcomingSchedule.status === 'pending' ? '확인 대기' : '예정'}
+                    </Text>
+                  </Pressable>
+                </View>
+              )}
+
+              {pendingSchedule && (
+                <View style={{ marginBottom: 14 }}>
+                  <Text style={{
+                    fontSize: 13,
+                    fontWeight: '900',
+                    color: '#8A8F98',
+                    marginBottom: 8,
+                    marginLeft: 6
+                  }}>확인 대기 일정</Text>
+                  <Pressable 
+                    onPress={() => {
+                      onChangeTab('캘린더');
+                      setTimeout(() => {
+                        DeviceEventEmitter.emit('goToCalendarDate', pendingSchedule.dateKey);
+                      }, 50);
+                    }}
+                    style={{
+                      flexDirection: 'row',
+                      alignItems: 'center',
+                      backgroundColor: '#FFFFFF',
+                      borderColor: '#E3E7EF',
+                      borderWidth: 1,
+                      borderRadius: 30,
+                      paddingHorizontal: 20,
+                      paddingVertical: 16,
+                    }}>
+                    <Text style={{ color: '#F97316', fontWeight: '900', fontSize: 15, marginRight: 14 }}>
+                      {pendingSchedule.dateKey.slice(5).replace('-', '.')}
+                    </Text>
+                    <Text style={{ flex: 1, color: '#111318', fontWeight: '800', fontSize: 15 }} numberOfLines={1}>
+                      {pendingSchedule.title}
+                    </Text>
+                    <Text style={{ color: '#F97316', fontWeight: '700', fontSize: 13, marginLeft: 10 }}>
+                      확인 대기
+                    </Text>
+                  </Pressable>
+                </View>
+              )}
 
               {recentSessions.length > 0 ? (
                 recentSessions.map((file) => (
@@ -3261,6 +3342,15 @@ function CalendarTab({
   const isLoading = status === 'loading';
   const currentMonthLabel = `${activeMonthDate.getFullYear()}년 ${activeMonthDate.getMonth() + 1}월`;
 
+  useEffect(() => {
+    const sub = DeviceEventEmitter.addListener('goToCalendarDate', (dateKey: string) => {
+      setSelectedDateKey(dateKey);
+      const date = parseDateKey(dateKey);
+      setActiveMonthDate(new Date(date.getFullYear(), date.getMonth(), 1));
+    });
+    return () => sub.remove();
+  }, []);
+
   const moveMonth = (offset: number) => {
     setActiveMonthDate((currentDate) => {
       const nextDate = new Date(currentDate);
@@ -3344,12 +3434,13 @@ function CalendarTab({
                 onPress={() => selectDay(day)}
                 style={[
                   styles.calendarDayCell,
+                  day.isToday && !isSelected && styles.calendarDayCellToday,
                   isSelected && styles.calendarDayCellSelected,
-                  day.isToday && styles.calendarDayCellToday,
                 ]}>
                 <Text
                   style={[
                     styles.calendarDayNumber,
+                    day.isToday && !isSelected && styles.calendarDayNumberToday,
                     day.muted && styles.calendarDayNumberMuted,
                     isSelected && styles.calendarDayNumberSelected,
                   ]}>
@@ -6476,13 +6567,17 @@ const styles = StyleSheet.create({
     borderColor: '#202329',
   },
   calendarDayCellToday: {
-    borderColor: '#2F80ED',
+    backgroundColor: '#EEF4FF',
+    borderColor: 'transparent',
   },
   calendarDayNumber: {
     color: '#202329',
     fontSize: 14,
     fontWeight: '900',
     lineHeight: 18,
+  },
+  calendarDayNumberToday: {
+    color: '#2563EB',
   },
   calendarDayNumberMuted: {
     color: '#BCC3CE',
@@ -6784,6 +6879,7 @@ const styles = StyleSheet.create({
     height: 126,
     justifyContent: 'center',
     marginBottom: 2,
+    marginTop: -20,
     overflow: 'hidden',
     width: '100%',
   },
