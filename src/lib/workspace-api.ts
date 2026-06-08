@@ -104,6 +104,20 @@ export type CreateWorkspaceFilePayload = {
   title: string;
 };
 
+export type UpdateWorkspaceFolderPayload = {
+  color?: string;
+  icon?: string;
+  title: string;
+};
+
+export type UpdateWorkspaceFilePayload = {
+  color?: string;
+  file_kind?: string;
+  icon?: string;
+  tag?: string;
+  title: string;
+};
+
 export type WorkspaceUploadFile = {
   mimeType?: string | null;
   name?: string | null;
@@ -278,6 +292,28 @@ export async function createWorkspaceFolder(payload: CreateWorkspaceFolderPayloa
   return result.node as WorkspaceFolderNode;
 }
 
+export async function updateWorkspaceFolder(folderId: string, payload: UpdateWorkspaceFolderPayload) {
+  const result = await requestWorkspaceJson(
+    `courses/${encodeURIComponent(folderId)}`,
+    jsonRequestOptions('PUT', payload),
+    '워크스페이스 폴더 수정에 실패했습니다.',
+  );
+
+  if (!result.node || typeof result.node !== 'object') {
+    throw new Error('워크스페이스 폴더 수정에 실패했습니다.');
+  }
+
+  return result.node as WorkspaceFolderNode;
+}
+
+export async function deleteWorkspaceFolder(folderId: string) {
+  return requestWorkspaceJson(
+    `courses/${encodeURIComponent(folderId)}`,
+    { method: 'DELETE' },
+    '워크스페이스 폴더 삭제에 실패했습니다.',
+  );
+}
+
 export async function createWorkspaceFile(payload: CreateWorkspaceFilePayload) {
   const result = await requestWorkspaceJson(
     'sessions',
@@ -290,6 +326,28 @@ export async function createWorkspaceFile(payload: CreateWorkspaceFilePayload) {
   }
 
   return result.node as WorkspaceFileNode;
+}
+
+export async function updateWorkspaceFile(fileId: string, payload: UpdateWorkspaceFilePayload) {
+  const result = await requestWorkspaceJson(
+    `sessions/${encodeURIComponent(fileId)}`,
+    jsonRequestOptions('PUT', payload),
+    '워크스페이스 파일 수정에 실패했습니다.',
+  );
+
+  if (!result.node || typeof result.node !== 'object') {
+    throw new Error('워크스페이스 파일 수정에 실패했습니다.');
+  }
+
+  return result.node as WorkspaceFileNode;
+}
+
+export async function deleteWorkspaceFile(fileId: string) {
+  return requestWorkspaceJson(
+    `sessions/${encodeURIComponent(fileId)}`,
+    { method: 'DELETE' },
+    '워크스페이스 파일 삭제에 실패했습니다.',
+  );
 }
 
 export async function saveSessionResources(sessionId: string, weeks: WorkspaceWeekResourcePayload[]) {
