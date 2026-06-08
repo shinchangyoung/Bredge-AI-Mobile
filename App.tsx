@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import * as DocumentPicker from 'expo-document-picker';
 import type { DocumentPickerAsset } from 'expo-document-picker';
@@ -33,17 +33,22 @@ import {
   TextInput,
   useWindowDimensions,
   View,
+  DeviceEventEmitter,
 } from 'react-native';
 
 import {
+  confirmWorkspaceSchedule,
   createWorkspaceSession,
   deleteWorkspaceRecordingData,
   getWorkspaceAssetUrl,
   getWorkspaceApiBaseUrl,
+  getWorkspaceSchedules,
   getWorkspaceSession,
   getWorkspaceTree,
+  ignoreWorkspaceSchedule,
   transcribeWorkspaceRecording,
   uploadWorkspaceRecording,
+  type WorkspaceScheduleItem,
   type WorkspaceFileNode,
   type WorkspaceMaterialResource,
   type WorkspaceNode,
@@ -112,7 +117,24 @@ type VoiceSourceFile = {
   uri: string;
 };
 
-type HomeTab = '최근' | '음성소스' | '폴더';
+type MobileScheduleStatus = 'pending' | 'confirmed' | 'ignored';
+type MobileScheduleItem = {
+  dateKey: string;
+  id: string;
+  note: string;
+  recordingId: string;
+  sourceSessionTitle: string;
+  sourceText: string;
+  startTime: string;
+  status: MobileScheduleStatus;
+  title: string;
+  transcriptId: string;
+  type: string;
+  typeLabel: string;
+  workspaceFileId: string;
+};
+
+type HomeTab = '최근' | '음성소스' | '폴더' | '캘린더';
 type WorkspaceLoadStatus = 'loading' | 'connected' | 'fallback';
 type RecordingSaveStatus = 'idle' | 'saving' | 'saved' | 'local' | 'failed';
 type SessionResourceKind = 'material' | 'recording';
@@ -154,7 +176,7 @@ const initialSessionFiles: SessionFile[] = [
   },
 ];
 
-const tabs: HomeTab[] = ['최근', '음성소스', '폴더'];
+const tabs: HomeTab[] = ['최근', '음성소스', '폴더', '캘린더'];
 const fileTags = ['수업', '회의', '프로젝트', '개인', '중요'];
 const fileColors = ['#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6'];
 const gridVerticalLines = Array.from({ length: 14 }, (_, index) => index);
@@ -522,6 +544,158 @@ function formatDisplayDateTime(value?: string) {
   return `${date.getFullYear()}. ${date.getMonth() + 1}. ${date.getDate()}. ${meridiem} ${hour}:${minute}`;
 }
 
+const scheduleTypeLabels: Record<string, string> = {
+  assignment: '과제',
+  etc: '기타',
+  exam: '시험',
+  lecture: '수업',
+  meeting: '회의',
+  presentation: '발표',
+  project: '프로젝트',
+};
+
+const scheduleEventTypeMap: Record<string, string> = {
+  강의: 'lecture',
+  과제: 'assignment',
+  기타: 'etc',
+  발표: 'presentation',
+  수업: 'lecture',
+  시험: 'exam',
+  제출: 'assignment',
+  프로젝트: 'project',
+  회의: 'meeting',
+};
+
+function formatDateKey(date = new Date()) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function parseDateKey(dateKey: string) {
+  const [year, month, day] = dateKey.split('-').map(Number);
+  return new Date(year, month - 1, day);
+}
+
+function formatKoreanDateLabel(dateKey: string) {
+  const [year, month, day] = dateKey.split('-').map(Number);
+  return `${year}년 ${month}월 ${day}일`;
+}
+
+function formatKoreanScheduleTime(date: Date) {
+  let hour = date.getHours();
+  const minute = String(date.getMinutes()).padStart(2, '0');
+  const meridiem = hour < 12 ? '오전' : '오후';
+  hour %= 12;
+  if (hour === 0) hour = 12;
+  return `${meridiem} ${String(hour).padStart(2, '0')}:${minute}`;
+}
+
+function parseScheduleDueDate(value?: string | null) {
+  if (!value) return null;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function normalizeScheduleStatus(status?: string | null, hasSourceText = false): MobileScheduleStatus {
+  if (status === 'pending' || status === 'confirmed' || status === 'ignored') return status;
+  if (status === '예정') return 'confirmed';
+  return hasSourceText ? 'pending' : 'confirmed';
+}
+
+function getScheduleStatusLabel(status: MobileScheduleStatus) {
+  if (status === 'pending') return '확인 필요';
+  if (status === 'ignored') return '무시됨';
+  return '예정';
+}
+
+function normalizeScheduleType(type?: string | null, hasSourceText = false) {
+  if (type && scheduleTypeLabels[type]) return type;
+  if (type && scheduleEventTypeMap[type]) return scheduleEventTypeMap[type];
+  return hasSourceText ? 'meeting' : 'etc';
+}
+
+function workspaceScheduleToMobileSchedule(item: WorkspaceScheduleItem): MobileScheduleItem {
+  const dueDate = parseScheduleDueDate(item.due_date);
+  const hasSourceText = Boolean(item.source_text);
+  const type = normalizeScheduleType(item.event_type, hasSourceText);
+  const status = normalizeScheduleStatus(item.status, hasSourceText);
+
+  return {
+    dateKey: dueDate ? formatDateKey(dueDate) : formatDateKey(),
+    id: item.schedule_id,
+    note: item.description || '',
+    recordingId: item.recording_id || '',
+    sourceSessionTitle: item.session_title || item.course_title || '',
+    sourceText: item.source_text || '',
+    startTime: dueDate ? formatKoreanScheduleTime(dueDate) : '',
+    status,
+    title: item.title || '제목 없는 일정',
+    transcriptId: item.transcript_id || '',
+    type,
+    typeLabel: scheduleTypeLabels[type] || '기타',
+    workspaceFileId: item.session_id || '',
+  };
+}
+
+function sortMobileSchedules(schedules: MobileScheduleItem[]) {
+  return [...schedules].sort((a, b) => {
+    const dateCompare = a.dateKey.localeCompare(b.dateKey);
+    if (dateCompare !== 0) return dateCompare;
+    return (a.startTime || '').localeCompare(b.startTime || '', 'ko-KR');
+  });
+}
+
+function buildCalendarDays(activeMonthDate: Date, schedules: MobileScheduleItem[]) {
+  const year = activeMonthDate.getFullYear();
+  const month = activeMonthDate.getMonth();
+  const firstDay = new Date(year, month, 1);
+  const lastDay = new Date(year, month + 1, 0);
+  const prevLastDay = new Date(year, month, 0);
+  const leadingCount = firstDay.getDay();
+  const trailingCount = 6 - lastDay.getDay();
+  const todayKey = formatDateKey();
+  const days: Array<{
+    dateKey: string;
+    hasConfirmedSchedule: boolean;
+    hasPendingSchedule: boolean;
+    isToday: boolean;
+    label: number;
+    muted: boolean;
+    schedules: MobileScheduleItem[];
+  }> = [];
+
+  const createDay = (date: Date, label: number, muted: boolean) => {
+    const dateKey = formatDateKey(date);
+    const daySchedules = schedules.filter((schedule) => schedule.dateKey === dateKey);
+    days.push({
+      dateKey,
+      hasConfirmedSchedule: daySchedules.some((schedule) => schedule.status === 'confirmed'),
+      hasPendingSchedule: daySchedules.some((schedule) => schedule.status === 'pending'),
+      isToday: dateKey === todayKey,
+      label,
+      muted,
+      schedules: daySchedules,
+    });
+  };
+
+  for (let index = leadingCount - 1; index >= 0; index -= 1) {
+    const label = prevLastDay.getDate() - index;
+    createDay(new Date(year, month - 1, label), label, true);
+  }
+
+  for (let label = 1; label <= lastDay.getDate(); label += 1) {
+    createDay(new Date(year, month, label), label, false);
+  }
+
+  for (let label = 1; label <= trailingCount; label += 1) {
+    createDay(new Date(year, month + 1, label), label, true);
+  }
+
+  return days;
+}
+
 function formatFileSize(size?: number) {
   if (typeof size !== 'number') {
     return undefined;
@@ -693,6 +867,11 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<HomeTab>('최근');
   const [workspaceStatus, setWorkspaceStatus] = useState<WorkspaceLoadStatus>('loading');
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
+  const [calendarSchedules, setCalendarSchedules] = useState<MobileScheduleItem[]>([]);
+  const [calendarStatus, setCalendarStatus] = useState<WorkspaceLoadStatus>('loading');
+  const [calendarError, setCalendarError] = useState<string | null>(null);
+  const [isCalendarRefreshing, setIsCalendarRefreshing] = useState(false);
+  const [updatingScheduleId, setUpdatingScheduleId] = useState<string | null>(null);
   const [createModalVisible, setCreateModalVisible] = useState(false);
   const [quickActionMenuVisible, setQuickActionMenuVisible] = useState(false);
   const [quickActionError, setQuickActionError] = useState<string | null>(null);
@@ -785,6 +964,93 @@ export default function App() {
     });
   };
 
+  const loadCalendarSchedules = useCallback(async (mode: 'initial' | 'refresh' = 'initial') => {
+    if (mode === 'refresh') {
+      setIsCalendarRefreshing(true);
+    } else {
+      setCalendarStatus('loading');
+    }
+
+    try {
+      const schedules = await getWorkspaceSchedules();
+      setCalendarSchedules(
+        sortMobileSchedules(
+          schedules
+            .map(workspaceScheduleToMobileSchedule)
+            .filter((schedule) => schedule.status !== 'ignored'),
+        ),
+      );
+      setCalendarStatus('connected');
+      setCalendarError(null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '일정 목록을 불러오지 못했습니다.';
+      setCalendarStatus('fallback');
+      setCalendarError(`${message} API 주소: ${getWorkspaceApiBaseUrl()}`);
+      setCalendarSchedules([]);
+    } finally {
+      setIsCalendarRefreshing(false);
+    }
+  }, []);
+
+  const updateCalendarScheduleStatus = async (scheduleId: string, status: MobileScheduleStatus) => {
+    if (status !== 'confirmed' && status !== 'ignored') return;
+
+    setUpdatingScheduleId(scheduleId);
+    try {
+      if (status === 'confirmed') {
+        await confirmWorkspaceSchedule(scheduleId);
+      } else {
+        await ignoreWorkspaceSchedule(scheduleId);
+      }
+
+      setCalendarSchedules((currentSchedules) =>
+        sortMobileSchedules(
+          currentSchedules
+            .map((schedule) => (schedule.id === scheduleId ? { ...schedule, status } : schedule))
+            .filter((schedule) => schedule.status !== 'ignored'),
+        ),
+      );
+      await loadCalendarSchedules('refresh');
+    } catch (error) {
+      Alert.alert('일정 동기화 실패', error instanceof Error ? error.message : '일정 상태를 변경하지 못했습니다.');
+    } finally {
+      setUpdatingScheduleId(null);
+    }
+  };
+
+  const loadWorkspaceData = useCallback(() => {
+    setWorkspaceStatus('loading');
+    getWorkspaceTree()
+      .then((tree) => {
+        const nextSessions = workspaceTreeToSessionFiles(tree);
+        const nextSessionIds = nextSessions.map((session) => session.id);
+
+        setSessions(nextSessions);
+        setRecentSessionIds((currentIds) => {
+          const validRecentIds = currentIds.filter((id) => nextSessionIds.includes(id));
+          return (validRecentIds.length > 0 ? validRecentIds : nextSessionIds).slice(0, 3);
+        });
+        setWorkspaceTree(tree);
+        setWorkspaceStatus('connected');
+        setWorkspaceError(null);
+      })
+      .catch((error) => {
+        setWorkspaceStatus('error');
+        setWorkspaceError(error instanceof Error ? error.message : '워크스페이스를 불러오지 못했습니다.');
+      });
+  }, []);
+
+  const loadGlobalData = useCallback(() => {
+    setActiveTab('최근');
+    void loadCalendarSchedules('refresh');
+    loadWorkspaceData();
+  }, [loadCalendarSchedules, loadWorkspaceData]);
+
+  useEffect(() => {
+    const sub = DeviceEventEmitter.addListener('globalRefresh', loadGlobalData);
+    return () => sub.remove();
+  }, [loadGlobalData]);
+
   useEffect(() => {
     let isMounted = true;
 
@@ -822,6 +1088,10 @@ export default function App() {
       isMounted = false;
     };
   }, []);
+
+  useEffect(() => {
+    void loadCalendarSchedules();
+  }, [loadCalendarSchedules]);
 
   useEffect(() => {
     let isMounted = true;
@@ -1569,7 +1839,24 @@ export default function App() {
           ) : (
             <HomeScreen
               activeTab={activeTab}
-              onChangeTab={setActiveTab}
+              calendarError={calendarError}
+              calendarSchedules={calendarSchedules}
+              calendarStatus={calendarStatus}
+              isCalendarRefreshing={isCalendarRefreshing}
+              onChangeTab={(tab) => {
+                setActiveTab(tab);
+                if (tab === '캘린더') {
+                  void loadCalendarSchedules('refresh');
+                } else if (tab === '폴더' || tab === '최근' || tab === '음성소스') {
+                  loadWorkspaceData();
+                }
+              }}
+              onConfirmSchedule={(scheduleId) => {
+                void updateCalendarScheduleStatus(scheduleId, 'confirmed');
+              }}
+              onIgnoreSchedule={(scheduleId) => {
+                void updateCalendarScheduleStatus(scheduleId, 'ignored');
+              }}
               onOpenSession={openSession}
               onOpenVoiceSaveModal={(sourceId) => {
                 setVoiceSaveError(null);
@@ -1577,8 +1864,12 @@ export default function App() {
               }}
               onRemoveVoiceSource={removeVoiceSource}
               onRenameVoiceSource={renameVoiceSource}
+              onRefreshCalendar={() => {
+                void loadCalendarSchedules('refresh');
+              }}
               recentSessionIds={recentSessionIds}
               sessions={sessions}
+              updatingScheduleId={updatingScheduleId}
               voiceSources={voiceSources}
               workspaceError={workspaceError}
               workspaceStatus={workspaceStatus}
@@ -1787,26 +2078,42 @@ export default function App() {
 
 function HomeScreen({
   activeTab,
+  calendarError,
+  calendarSchedules,
+  calendarStatus,
+  isCalendarRefreshing,
   onChangeTab,
+  onConfirmSchedule,
+  onIgnoreSchedule,
   onOpenSession,
   onOpenVoiceSaveModal,
   onRemoveVoiceSource,
   onRenameVoiceSource,
+  onRefreshCalendar,
   recentSessionIds,
   sessions,
+  updatingScheduleId,
   voiceSources,
   workspaceError,
   workspaceStatus,
   workspaceTree,
 }: {
   activeTab: HomeTab;
+  calendarError: string | null;
+  calendarSchedules: MobileScheduleItem[];
+  calendarStatus: WorkspaceLoadStatus;
+  isCalendarRefreshing: boolean;
   onChangeTab: (tab: HomeTab) => void;
+  onConfirmSchedule: (scheduleId: string) => void;
+  onIgnoreSchedule: (scheduleId: string) => void;
   onOpenSession: (sessionId: string) => void;
   onOpenVoiceSaveModal: (sourceId: string) => void;
   onRemoveVoiceSource: (sourceId: string) => void;
   onRenameVoiceSource: (sourceId: string, title: string) => void;
+  onRefreshCalendar: () => void;
   recentSessionIds: string[];
   sessions: SessionFile[];
+  updatingScheduleId: string | null;
   voiceSources: VoiceSourceFile[];
   workspaceError: string | null;
   workspaceStatus: WorkspaceLoadStatus;
@@ -1822,7 +2129,9 @@ function HomeScreen({
     <>
       <View style={styles.topPanel}>
         <View style={styles.header}>
-          <Image source={require('./assets/groupchat/logo.png')} style={styles.projectLogo} />
+          <Pressable onPress={() => DeviceEventEmitter.emit('globalRefresh')}>
+            <Image source={require('./assets/groupchat/logo.png')} style={styles.projectLogo} />
+          </Pressable>
           <Image source={require('./assets/groupchat/Btitle.png')} style={styles.headerTitleImage} />
         </View>
 
@@ -1876,6 +2185,20 @@ function HomeScreen({
             />
           )}
 
+          {activeTab === '캘린더' && (
+            <CalendarTab
+              error={calendarError}
+              isRefreshing={isCalendarRefreshing}
+              onConfirmSchedule={onConfirmSchedule}
+              onIgnoreSchedule={onIgnoreSchedule}
+              onOpenSession={onOpenSession}
+              onRefresh={onRefreshCalendar}
+              schedules={calendarSchedules}
+              status={calendarStatus}
+              updatingScheduleId={updatingScheduleId}
+            />
+          )}
+
         </ScrollView>
       </View>
     </>
@@ -1887,6 +2210,10 @@ function HomeTabIcon({ active, tab }: { active: boolean; tab: HomeTab }) {
 
   if (tab === '음성소스') {
     return <SourceVoiceIcon color={iconColor} size={30} />;
+  }
+
+  if (tab === '캘린더') {
+    return <Feather color={iconColor} name="calendar" size={26} strokeWidth={2.5} />;
   }
 
   const iconName = tab === '최근' ? 'home' : 'folder';
@@ -2898,6 +3225,281 @@ function WorkspaceTreeNodeItem({
       ) : isOpen ? (
         <Text style={styles.folderEmptyInlineText}>비어 있는 폴더입니다.</Text>
       ) : null}
+    </View>
+  );
+}
+
+function CalendarTab({
+  error,
+  isRefreshing,
+  onConfirmSchedule,
+  onIgnoreSchedule,
+  onOpenSession,
+  onRefresh,
+  schedules,
+  status,
+  updatingScheduleId,
+}: {
+  error: string | null;
+  isRefreshing: boolean;
+  onConfirmSchedule: (scheduleId: string) => void;
+  onIgnoreSchedule: (scheduleId: string) => void;
+  onOpenSession: (sessionId: string) => void;
+  onRefresh: () => void;
+  schedules: MobileScheduleItem[];
+  status: WorkspaceLoadStatus;
+  updatingScheduleId: string | null;
+}) {
+  const today = new Date();
+  const todayKey = formatDateKey(today);
+  const [activeMonthDate, setActiveMonthDate] = useState(new Date(today.getFullYear(), today.getMonth(), 1));
+  const [selectedDateKey, setSelectedDateKey] = useState(todayKey);
+  const visibleSchedules = sortMobileSchedules(schedules.filter((schedule) => schedule.status !== 'ignored'));
+  const calendarDays = buildCalendarDays(activeMonthDate, visibleSchedules);
+  const selectedSchedules = visibleSchedules.filter((schedule) => schedule.dateKey === selectedDateKey);
+  const upcomingSchedules = visibleSchedules.filter((schedule) => schedule.dateKey >= todayKey).slice(0, 5);
+  const isLoading = status === 'loading';
+  const currentMonthLabel = `${activeMonthDate.getFullYear()}년 ${activeMonthDate.getMonth() + 1}월`;
+
+  const moveMonth = (offset: number) => {
+    setActiveMonthDate((currentDate) => {
+      const nextDate = new Date(currentDate);
+      nextDate.setMonth(nextDate.getMonth() + offset);
+      return nextDate;
+    });
+  };
+
+  const moveToday = () => {
+    const nextToday = new Date();
+    setActiveMonthDate(new Date(nextToday.getFullYear(), nextToday.getMonth(), 1));
+    setSelectedDateKey(formatDateKey(nextToday));
+  };
+
+  const selectDay = (day: ReturnType<typeof buildCalendarDays>[number]) => {
+    setSelectedDateKey(day.dateKey);
+    if (day.muted) {
+      const date = parseDateKey(day.dateKey);
+      setActiveMonthDate(new Date(date.getFullYear(), date.getMonth(), 1));
+    }
+  };
+
+  return (
+    <View style={styles.calendarTab}>
+      <View style={styles.calendarHeader}>
+        <View>
+          <Text style={styles.calendarTitle}>캘린더</Text>
+          <Text style={styles.calendarSubtitle}>
+            {isLoading ? '웹 일정 데이터를 불러오는 중...' : `${visibleSchedules.length}개 일정 · 웹 DB 동기화`}
+          </Text>
+        </View>
+
+        <Pressable
+          disabled={isRefreshing}
+          onPress={onRefresh}
+          style={[styles.calendarRefreshButton, isRefreshing && styles.calendarRefreshButtonDisabled]}>
+          <Feather color="#202329" name="refresh-cw" size={18} strokeWidth={2.5} />
+        </Pressable>
+      </View>
+
+      {status === 'fallback' ? (
+        <View style={[styles.workspaceStatusCard, styles.workspaceStatusCardWarning]}>
+          <Text style={[styles.workspaceStatusText, styles.workspaceStatusTextWarning]}>
+            {error ?? '일정 데이터 연결에 실패했습니다.'}
+          </Text>
+        </View>
+      ) : null}
+
+      <View style={styles.calendarMonthCard}>
+        <View style={styles.calendarMonthToolbar}>
+          <Pressable onPress={() => moveMonth(-1)} style={styles.calendarMonthNavButton}>
+            <Feather color="#202329" name="chevron-left" size={22} strokeWidth={2.6} />
+          </Pressable>
+          <Text style={styles.calendarMonthTitle}>{currentMonthLabel}</Text>
+          <View style={styles.calendarMonthActions}>
+            <Pressable onPress={moveToday} style={styles.calendarTodayButton}>
+              <Text style={styles.calendarTodayText}>오늘</Text>
+            </Pressable>
+            <Pressable onPress={() => moveMonth(1)} style={styles.calendarMonthNavButton}>
+              <Feather color="#202329" name="chevron-right" size={22} strokeWidth={2.6} />
+            </Pressable>
+          </View>
+        </View>
+
+        <View style={styles.calendarWeekdayRow}>
+          {['일', '월', '화', '수', '목', '금', '토'].map((dayName) => (
+            <Text key={dayName} style={styles.calendarWeekdayText}>
+              {dayName}
+            </Text>
+          ))}
+        </View>
+
+        <View style={styles.calendarGrid}>
+          {calendarDays.map((day) => {
+            const isSelected = day.dateKey === selectedDateKey;
+            const hasSchedule = day.schedules.length > 0;
+
+            return (
+              <Pressable
+                key={day.dateKey}
+                onPress={() => selectDay(day)}
+                style={[
+                  styles.calendarDayCell,
+                  isSelected && styles.calendarDayCellSelected,
+                  day.isToday && styles.calendarDayCellToday,
+                ]}>
+                <Text
+                  style={[
+                    styles.calendarDayNumber,
+                    day.muted && styles.calendarDayNumberMuted,
+                    isSelected && styles.calendarDayNumberSelected,
+                  ]}>
+                  {day.label}
+                </Text>
+                {hasSchedule ? (
+                  <View style={styles.calendarDayDots}>
+                    {day.hasConfirmedSchedule && <View style={[styles.calendarDayDot, styles.calendarDayDotConfirmed]} />}
+                    {day.hasPendingSchedule && <View style={[styles.calendarDayDot, styles.calendarDayDotPending]} />}
+                  </View>
+                ) : null}
+              </Pressable>
+            );
+          })}
+        </View>
+      </View>
+
+      <View style={styles.calendarSelectedSection}>
+        <View style={styles.calendarSectionHeader}>
+          <Text style={styles.calendarSectionTitle}>{formatKoreanDateLabel(selectedDateKey)}</Text>
+          <Text style={styles.calendarSectionMeta}>{selectedSchedules.length}개 일정</Text>
+        </View>
+
+        {selectedSchedules.length > 0 ? (
+          selectedSchedules.map((schedule) => (
+            <MobileScheduleCard
+              key={schedule.id}
+              onConfirm={onConfirmSchedule}
+              onIgnore={onIgnoreSchedule}
+              onOpenSession={onOpenSession}
+              schedule={schedule}
+              updatingScheduleId={updatingScheduleId}
+            />
+          ))
+        ) : (
+          <View style={styles.calendarEmptyCard}>
+            <MaterialIcons color="#9AA2B1" name="event-busy" size={34} />
+            <Text style={styles.calendarEmptyTitle}>
+              {isLoading ? '일정을 불러오는 중입니다.' : '선택한 날짜의 일정이 없습니다.'}
+            </Text>
+            <Text style={styles.calendarEmptyDescription}>
+              웹에서 저장되거나 확정한 일정이 있으면 이 캘린더에 함께 표시됩니다.
+            </Text>
+          </View>
+        )}
+      </View>
+
+      {upcomingSchedules.length > 0 ? (
+        <View style={styles.calendarUpcomingSection}>
+          <Text style={styles.calendarSectionTitle}>다가오는 일정</Text>
+          <View style={styles.calendarUpcomingList}>
+            {upcomingSchedules.map((schedule) => (
+              <Pressable
+                key={`upcoming-${schedule.id}`}
+                onPress={() => {
+                  const date = parseDateKey(schedule.dateKey);
+                  setSelectedDateKey(schedule.dateKey);
+                  setActiveMonthDate(new Date(date.getFullYear(), date.getMonth(), 1));
+                }}
+                style={styles.calendarUpcomingItem}>
+                <Text style={styles.calendarUpcomingDate}>{schedule.dateKey.slice(5).replace('-', '.')}</Text>
+                <Text numberOfLines={1} style={styles.calendarUpcomingTitle}>
+                  {schedule.title}
+                </Text>
+                <Text style={styles.calendarUpcomingStatus}>{getScheduleStatusLabel(schedule.status)}</Text>
+              </Pressable>
+            ))}
+          </View>
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
+function MobileScheduleCard({
+  onConfirm,
+  onIgnore,
+  onOpenSession,
+  schedule,
+  updatingScheduleId,
+}: {
+  onConfirm: (scheduleId: string) => void;
+  onIgnore: (scheduleId: string) => void;
+  onOpenSession: (sessionId: string) => void;
+  schedule: MobileScheduleItem;
+  updatingScheduleId: string | null;
+}) {
+  const isUpdating = updatingScheduleId === schedule.id;
+  const isPending = schedule.status === 'pending';
+  const canOpenSession = Boolean(schedule.workspaceFileId);
+
+  return (
+    <View style={[styles.scheduleCard, isPending && styles.scheduleCardPending]}>
+      <View style={styles.scheduleCardTopRow}>
+        <View style={styles.scheduleTypeChip}>
+          <MaterialIcons color="#2563EB" name={schedule.type === 'meeting' ? 'groups' : 'event-note'} size={15} />
+          <Text style={styles.scheduleTypeText}>{schedule.typeLabel}</Text>
+        </View>
+        <Text style={[styles.scheduleStatusText, isPending && styles.scheduleStatusPendingText]}>
+          {getScheduleStatusLabel(schedule.status)}
+        </Text>
+      </View>
+
+      <Text numberOfLines={2} style={styles.scheduleCardTitle}>
+        {schedule.title}
+      </Text>
+
+      <View style={styles.scheduleMetaRow}>
+        <Feather color="#7E8797" name="clock" size={14} strokeWidth={2.5} />
+        <Text numberOfLines={1} style={styles.scheduleMetaText}>
+          {[schedule.startTime, schedule.sourceSessionTitle || '웹 일정'].filter(Boolean).join(' · ')}
+        </Text>
+      </View>
+
+      {schedule.note ? (
+        <Text numberOfLines={2} style={styles.scheduleNoteText}>
+          {schedule.note}
+        </Text>
+      ) : null}
+
+      {schedule.sourceText ? (
+        <Text numberOfLines={2} style={styles.scheduleSourceText}>
+          “{schedule.sourceText}”
+        </Text>
+      ) : null}
+
+      <View style={styles.scheduleActionRow}>
+        {isPending ? (
+          <>
+            <Pressable
+              disabled={isUpdating}
+              onPress={() => onConfirm(schedule.id)}
+              style={[styles.scheduleActionButton, styles.scheduleConfirmButton, isUpdating && styles.scheduleActionButtonDisabled]}>
+              <Text style={styles.scheduleConfirmText}>{isUpdating ? '동기화 중' : '확정'}</Text>
+            </Pressable>
+            <Pressable
+              disabled={isUpdating}
+              onPress={() => onIgnore(schedule.id)}
+              style={[styles.scheduleActionButton, styles.scheduleIgnoreButton, isUpdating && styles.scheduleActionButtonDisabled]}>
+              <Text style={styles.scheduleIgnoreText}>무시</Text>
+            </Pressable>
+          </>
+        ) : null}
+
+        {canOpenSession ? (
+          <Pressable onPress={() => onOpenSession(schedule.workspaceFileId)} style={styles.scheduleOpenButton}>
+            <Text style={styles.scheduleOpenText}>파일 열기</Text>
+          </Pressable>
+        ) : null}
+      </View>
     </View>
   );
 }
@@ -5753,6 +6355,376 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     lineHeight: 17,
     paddingHorizontal: 14,
+  },
+  calendarTab: {
+    gap: 14,
+  },
+  calendarHeader: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingHorizontal: 4,
+    paddingTop: 2,
+  },
+  calendarTitle: {
+    color: '#202329',
+    fontSize: 28,
+    fontWeight: '900',
+    lineHeight: 34,
+  },
+  calendarSubtitle: {
+    color: '#8B919C',
+    fontSize: 13,
+    fontWeight: '800',
+    lineHeight: 18,
+    marginTop: 4,
+  },
+  calendarRefreshButton: {
+    alignItems: 'center',
+    backgroundColor: '#FFFFFF',
+    borderColor: '#E2E7F0',
+    borderRadius: 18,
+    borderWidth: 1,
+    height: 42,
+    justifyContent: 'center',
+    width: 42,
+  },
+  calendarRefreshButtonDisabled: {
+    opacity: 0.45,
+  },
+  calendarMonthCard: {
+    backgroundColor: 'rgba(255,255,255,0.95)',
+    borderColor: '#E1E7F0',
+    borderRadius: 24,
+    borderWidth: 1,
+    padding: 14,
+    shadowColor: '#101828',
+    shadowOffset: { height: 10, width: 0 },
+    shadowOpacity: 0.04,
+    shadowRadius: 18,
+  },
+  calendarMonthToolbar: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 14,
+  },
+  calendarMonthNavButton: {
+    alignItems: 'center',
+    backgroundColor: '#F4F7FB',
+    borderRadius: 15,
+    height: 34,
+    justifyContent: 'center',
+    width: 34,
+  },
+  calendarMonthTitle: {
+    color: '#202329',
+    flex: 1,
+    fontSize: 18,
+    fontWeight: '900',
+    lineHeight: 24,
+    paddingHorizontal: 12,
+  },
+  calendarMonthActions: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 8,
+  },
+  calendarTodayButton: {
+    alignItems: 'center',
+    backgroundColor: '#EEF4FF',
+    borderRadius: 999,
+    justifyContent: 'center',
+    minHeight: 34,
+    paddingHorizontal: 12,
+  },
+  calendarTodayText: {
+    color: '#2563EB',
+    fontSize: 12,
+    fontWeight: '900',
+    lineHeight: 16,
+  },
+  calendarWeekdayRow: {
+    flexDirection: 'row',
+    marginBottom: 8,
+  },
+  calendarWeekdayText: {
+    color: '#8B919C',
+    flex: 1,
+    fontSize: 11,
+    fontWeight: '900',
+    lineHeight: 15,
+    textAlign: 'center',
+  },
+  calendarGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    rowGap: 7,
+  },
+  calendarDayCell: {
+    alignItems: 'center',
+    borderColor: 'transparent',
+    borderRadius: 16,
+    borderWidth: 1,
+    height: 42,
+    justifyContent: 'center',
+    position: 'relative',
+    width: `${100 / 7}%`,
+  },
+  calendarDayCellSelected: {
+    backgroundColor: '#202329',
+    borderColor: '#202329',
+  },
+  calendarDayCellToday: {
+    borderColor: '#2F80ED',
+  },
+  calendarDayNumber: {
+    color: '#202329',
+    fontSize: 14,
+    fontWeight: '900',
+    lineHeight: 18,
+  },
+  calendarDayNumberMuted: {
+    color: '#BCC3CE',
+  },
+  calendarDayNumberSelected: {
+    color: '#FFFFFF',
+  },
+  calendarDayDots: {
+    bottom: 5,
+    flexDirection: 'row',
+    gap: 3,
+    position: 'absolute',
+  },
+  calendarDayDot: {
+    borderRadius: 999,
+    height: 4,
+    width: 4,
+  },
+  calendarDayDotConfirmed: {
+    backgroundColor: '#2F80ED',
+  },
+  calendarDayDotPending: {
+    backgroundColor: '#F97316',
+  },
+  calendarSelectedSection: {
+    gap: 10,
+  },
+  calendarSectionHeader: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingHorizontal: 4,
+  },
+  calendarSectionTitle: {
+    color: '#202329',
+    fontSize: 18,
+    fontWeight: '900',
+    lineHeight: 24,
+  },
+  calendarSectionMeta: {
+    color: '#8B919C',
+    fontSize: 12,
+    fontWeight: '900',
+    lineHeight: 16,
+  },
+  calendarEmptyCard: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(255,255,255,0.92)',
+    borderColor: '#E4E8F0',
+    borderRadius: 22,
+    borderWidth: 1,
+    justifyContent: 'center',
+    minHeight: 156,
+    padding: 20,
+  },
+  calendarEmptyTitle: {
+    color: '#202329',
+    fontSize: 16,
+    fontWeight: '900',
+    lineHeight: 22,
+    marginTop: 10,
+    textAlign: 'center',
+  },
+  calendarEmptyDescription: {
+    color: '#8B919C',
+    fontSize: 12,
+    fontWeight: '700',
+    lineHeight: 18,
+    marginTop: 6,
+    textAlign: 'center',
+  },
+  scheduleCard: {
+    backgroundColor: 'rgba(255,255,255,0.95)',
+    borderColor: '#E1E7F0',
+    borderRadius: 20,
+    borderWidth: 1,
+    gap: 9,
+    padding: 14,
+    shadowColor: '#101828',
+    shadowOffset: { height: 8, width: 0 },
+    shadowOpacity: 0.03,
+    shadowRadius: 14,
+  },
+  scheduleCardPending: {
+    borderColor: '#FED7AA',
+  },
+  scheduleCardTopRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  scheduleTypeChip: {
+    alignItems: 'center',
+    backgroundColor: '#EEF4FF',
+    borderRadius: 999,
+    flexDirection: 'row',
+    gap: 5,
+    minHeight: 26,
+    paddingHorizontal: 9,
+  },
+  scheduleTypeText: {
+    color: '#2563EB',
+    fontSize: 12,
+    fontWeight: '900',
+    lineHeight: 16,
+  },
+  scheduleStatusText: {
+    color: '#2F80ED',
+    flexShrink: 0,
+    fontSize: 12,
+    fontWeight: '900',
+    lineHeight: 16,
+  },
+  scheduleStatusPendingText: {
+    color: '#F97316',
+  },
+  scheduleCardTitle: {
+    color: '#202329',
+    fontSize: 18,
+    fontWeight: '900',
+    lineHeight: 24,
+  },
+  scheduleMetaRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 6,
+  },
+  scheduleMetaText: {
+    color: '#7E8797',
+    flex: 1,
+    fontSize: 12,
+    fontWeight: '800',
+    lineHeight: 17,
+  },
+  scheduleNoteText: {
+    color: '#5F6877',
+    fontSize: 13,
+    fontWeight: '700',
+    lineHeight: 19,
+  },
+  scheduleSourceText: {
+    backgroundColor: '#F6F8FB',
+    borderRadius: 12,
+    color: '#6F7785',
+    fontSize: 12,
+    fontWeight: '700',
+    lineHeight: 18,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  scheduleActionRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 2,
+  },
+  scheduleActionButton: {
+    alignItems: 'center',
+    borderRadius: 999,
+    justifyContent: 'center',
+    minHeight: 34,
+    paddingHorizontal: 13,
+  },
+  scheduleActionButtonDisabled: {
+    opacity: 0.45,
+  },
+  scheduleConfirmButton: {
+    backgroundColor: '#111318',
+  },
+  scheduleConfirmText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '900',
+    lineHeight: 16,
+  },
+  scheduleIgnoreButton: {
+    backgroundColor: '#FFF1F1',
+  },
+  scheduleIgnoreText: {
+    color: '#E5484D',
+    fontSize: 12,
+    fontWeight: '900',
+    lineHeight: 16,
+  },
+  scheduleOpenButton: {
+    alignItems: 'center',
+    backgroundColor: '#EEF4FF',
+    borderRadius: 999,
+    justifyContent: 'center',
+    marginLeft: 'auto',
+    minHeight: 34,
+    paddingHorizontal: 13,
+  },
+  scheduleOpenText: {
+    color: '#2563EB',
+    fontSize: 12,
+    fontWeight: '900',
+    lineHeight: 16,
+  },
+  calendarUpcomingSection: {
+    gap: 10,
+    marginTop: 2,
+  },
+  calendarUpcomingList: {
+    backgroundColor: 'rgba(255,255,255,0.92)',
+    borderColor: '#E4E8F0',
+    borderRadius: 20,
+    borderWidth: 1,
+    overflow: 'hidden',
+  },
+  calendarUpcomingItem: {
+    alignItems: 'center',
+    borderBottomColor: '#EEF1F5',
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    flexDirection: 'row',
+    gap: 10,
+    minHeight: 48,
+    paddingHorizontal: 13,
+  },
+  calendarUpcomingDate: {
+    color: '#2563EB',
+    flexShrink: 0,
+    fontSize: 12,
+    fontWeight: '900',
+    lineHeight: 16,
+    width: 42,
+  },
+  calendarUpcomingTitle: {
+    color: '#202329',
+    flex: 1,
+    fontSize: 13,
+    fontWeight: '900',
+    lineHeight: 18,
+  },
+  calendarUpcomingStatus: {
+    color: '#8B919C',
+    flexShrink: 0,
+    fontSize: 11,
+    fontWeight: '900',
+    lineHeight: 15,
   },
   folderEmptyCard: {
     alignItems: 'center',
