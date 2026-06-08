@@ -1,6 +1,6 @@
 import MaterialIcons from '@expo/vector-icons/MaterialIcons';
-import { useRouter } from 'expo-router';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useFocusEffect, useRouter } from 'expo-router';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -15,13 +15,18 @@ import {
   TextInput,
   useWindowDimensions,
   View,
+  DeviceEventEmitter,
 } from 'react-native';
 
 import {
   createWorkspaceFile,
   createWorkspaceFolder,
+  deleteWorkspaceFile,
+  deleteWorkspaceFolder,
   getWorkspaceApiBaseUrl,
   getWorkspaceTree,
+  updateWorkspaceFile,
+  updateWorkspaceFolder,
   type WorkspaceFileNode,
   type WorkspaceFolderNode,
   type WorkspaceNode,
@@ -30,7 +35,9 @@ import {
 type ViewMode = 'list' | 'grid';
 type SortType = 'latest' | 'title';
 type Folder = {
+  color?: string;
   id: string;
+  isDefaultFolder?: boolean;
   name: string;
   count: number;
 };
@@ -42,9 +49,19 @@ type WorkItem = {
   folder: string;
   folderId?: string;
   date: string;
+  fileKind?: string;
   sourceCount: number;
   color: string;
   starred?: boolean;
+};
+
+type EditableWorkspaceItem = {
+  color: string;
+  fileKind?: string;
+  id: string;
+  name: string;
+  tag?: string;
+  type: 'file' | 'folder';
 };
 
 type LoadMode = 'initial' | 'refresh';
@@ -53,6 +70,14 @@ type CreateModalMode = 'file' | 'folder' | null;
 const fileTags = ['수업', '회의', '프로젝트', '개인', '중요'];
 const themeColors = ['#3B82F6', '#8B5CF6', '#2DD4BF', '#F59E0B', '#EF4444'];
 const DEFAULT_FILE_ICON = 'article';
+const GRID_COLUMN_COUNT = 3;
+const GRID_GAP = 14;
+const GRID_CARD_WIDTH_RATIO = 0.31;
+const GRID_CARD_ASPECT_RATIO = 1.22;
+
+function isDefaultFolderName(name?: string) {
+  return name === '기본폴더' || name === '기본파일';
+}
 
 function buildWorkspaceData(tree: WorkspaceNode[]) {
   const folders: Folder[] = [];
@@ -68,7 +93,9 @@ function buildWorkspaceData(tree: WorkspaceNode[]) {
     nodes.forEach((node) => {
       if (node.type === 'folder') {
         folders.push({
+          color: node.color,
           id: node.id,
+          isDefaultFolder: node.isDefaultFolder || isDefaultFolderName(node.name),
           name: node.name || '새 폴더',
           count: countFiles(node.children ?? []),
         });
@@ -92,6 +119,7 @@ function toWorkItem(node: WorkspaceFileNode, parentFolder?: WorkspaceFolderNode)
     id: node.id,
     name: node.name || '새 파일',
     type: 'file',
+    fileKind: node.fileKind || (tag === '회의' ? 'meeting' : 'lecture'),
     tag,
     folder: parentFolder?.name ?? '-',
     folderId: parentFolder?.id,
@@ -118,13 +146,36 @@ export default function WorkfolderScreen() {
   const [customTag, setCustomTag] = useState('');
   const [selectedColor, setSelectedColor] = useState(themeColors[0]);
   const [isSubmittingCreate, setIsSubmittingCreate] = useState(false);
+  const [isCreatingFolderInline, setIsCreatingFolderInline] = useState(false);
+  const [draftFolderName, setDraftFolderName] = useState('');
+  const [isSubmittingFolderCreate, setIsSubmittingFolderCreate] = useState(false);
+  const folderCreateCommittedRef = useRef(false);
+  const [editingItem, setEditingItem] = useState<EditableWorkspaceItem | null>(null);
+  const [editingName, setEditingName] = useState('');
+  const [editingTag, setEditingTag] = useState(fileTags[0]);
+  const [editingCustomTag, setEditingCustomTag] = useState('');
+  const [editingColor, setEditingColor] = useState(themeColors[0]);
+  const [isEditingCustomTagOpen, setIsEditingCustomTagOpen] = useState(false);
+  const [isSubmittingEdit, setIsSubmittingEdit] = useState(false);
 
   const layout = useMemo(() => {
     const railWidth = clamp(width * 0.052, 72, 88);
     const sidebarWidth = clamp(width * 0.16, 230, 300);
     const mainPadding = clamp(width * 0.034, 40, 64);
-    return { railWidth, sidebarWidth, mainPadding };
+    const contentWidth = width - railWidth - sidebarWidth - 18 - mainPadding * 2;
+    const maxGridCardWidth = (contentWidth - GRID_GAP * (GRID_COLUMN_COUNT - 1)) / GRID_COLUMN_COUNT;
+    const gridCardWidth = clamp(contentWidth * GRID_CARD_WIDTH_RATIO, 220, maxGridCardWidth);
+    const gridCardHeight = gridCardWidth / GRID_CARD_ASPECT_RATIO;
+    return { railWidth, sidebarWidth, mainPadding, gridCardWidth, gridCardHeight };
   }, [width]);
+
+  const gridCardSizeStyle = useMemo(
+    () => ({
+      height: layout.gridCardHeight,
+      width: layout.gridCardWidth,
+    }),
+    [layout.gridCardHeight, layout.gridCardWidth],
+  );
 
   const workspaceData = useMemo(() => buildWorkspaceData(workspaceTree), [workspaceTree]);
   const folders = workspaceData.folders;
@@ -170,8 +221,18 @@ export default function WorkfolderScreen() {
     }
   }, [apiBaseUrl]);
 
+  useFocusEffect(
+    useCallback(() => {
+      loadWorkspace();
+    }, [loadWorkspace])
+  );
+
   useEffect(() => {
-    loadWorkspace();
+    const subscription = DeviceEventEmitter.addListener('globalRefresh', () => {
+      loadWorkspace();
+    });
+    
+    return () => subscription.remove();
   }, [loadWorkspace]);
 
   useEffect(() => {
@@ -194,6 +255,41 @@ export default function WorkfolderScreen() {
     router.push(`/workspace?sessionId=${encodeURIComponent(item.id)}`);
   };
 
+  const openFileEditModal = (item: WorkItem) => {
+    const nextTag = item.tag || (item.fileKind === 'meeting' ? '회의' : '수업');
+    const isCustomTag = !fileTags.includes(nextTag);
+
+    setEditingItem({
+      color: item.color,
+      fileKind: item.fileKind,
+      id: item.id,
+      name: item.name,
+      tag: nextTag,
+      type: 'file',
+    });
+    setEditingName(item.name);
+    setEditingTag(isCustomTag ? fileTags[0] : nextTag);
+    setEditingCustomTag(isCustomTag ? nextTag : '');
+    setEditingColor(item.color);
+    setIsEditingCustomTagOpen(isCustomTag);
+  };
+
+  const openFolderEditModal = (folder: Folder) => {
+    if (folder.isDefaultFolder || isDefaultFolderName(folder.name)) return;
+
+    setEditingItem({
+      color: folder.color || themeColors[0],
+      id: folder.id,
+      name: folder.name,
+      type: 'folder',
+    });
+    setEditingName(folder.name);
+    setEditingTag(fileTags[0]);
+    setEditingCustomTag('');
+    setEditingColor(folder.color || themeColors[0]);
+    setIsEditingCustomTagOpen(false);
+  };
+
   const openCreateModal = (mode: Exclude<CreateModalMode, null>) => {
     setCreateModalMode(mode);
     setCreateName('');
@@ -207,6 +303,139 @@ export default function WorkfolderScreen() {
     setCreateModalMode(null);
     setCreateName('');
     setCustomTag('');
+  };
+
+  const startInlineFolderCreate = () => {
+    if (isSubmittingFolderCreate) return;
+
+    folderCreateCommittedRef.current = false;
+    setDraftFolderName('');
+    setIsCreatingFolderInline(true);
+  };
+
+  const cancelInlineFolderCreate = () => {
+    if (isSubmittingFolderCreate) return;
+
+    folderCreateCommittedRef.current = true;
+    setDraftFolderName('');
+    setIsCreatingFolderInline(false);
+  };
+
+  const commitInlineFolderCreate = async () => {
+    if (!isCreatingFolderInline || isSubmittingFolderCreate || folderCreateCommittedRef.current) return;
+
+    const titleValue = draftFolderName.trim();
+    folderCreateCommittedRef.current = true;
+    setIsCreatingFolderInline(false);
+    setDraftFolderName('');
+
+    if (!titleValue) {
+      folderCreateCommittedRef.current = false;
+      return;
+    }
+
+    setIsSubmittingFolderCreate(true);
+    try {
+      await createWorkspaceFolder({
+        color: themeColors[0],
+        icon: 'folder',
+        parent_course_id: null,
+        title: titleValue,
+      });
+      await loadWorkspace('refresh');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '폴더를 만들지 못했습니다.';
+      Alert.alert('폴더 생성 실패', message);
+    } finally {
+      setIsSubmittingFolderCreate(false);
+      folderCreateCommittedRef.current = false;
+    }
+  };
+
+  const closeEditModal = (force = false) => {
+    if (isSubmittingEdit && !force) return;
+
+    setEditingItem(null);
+    setEditingName('');
+    setEditingTag(fileTags[0]);
+    setEditingCustomTag('');
+    setEditingColor(themeColors[0]);
+    setIsEditingCustomTagOpen(false);
+  };
+
+  const selectEditingTag = (tag: string) => {
+    setEditingTag(tag);
+    setEditingCustomTag('');
+    setIsEditingCustomTagOpen(false);
+  };
+
+  const updateEditingCustomTag = (tag: string) => {
+    setEditingCustomTag(tag);
+    if (tag.trim()) {
+      setEditingTag(tag.trim());
+    }
+  };
+
+  const submitEdit = async () => {
+    if (!editingItem) return;
+
+    const titleValue = editingName.trim();
+    if (!titleValue) {
+      Alert.alert('이름이 필요해요', editingItem.type === 'folder' ? '폴더 이름을 입력해 주세요.' : '파일 이름을 입력해 주세요.');
+      return;
+    }
+
+    setIsSubmittingEdit(true);
+    try {
+      if (editingItem.type === 'folder') {
+        await updateWorkspaceFolder(editingItem.id, {
+          color: editingColor,
+          icon: 'folder',
+          title: titleValue,
+        });
+      } else {
+        const tag = editingCustomTag.trim() || editingTag.trim() || fileTags[0];
+        await updateWorkspaceFile(editingItem.id, {
+          color: editingColor,
+          file_kind: tag === '회의' ? 'meeting' : editingItem.fileKind || 'lecture',
+          icon: DEFAULT_FILE_ICON,
+          tag,
+          title: titleValue,
+        });
+      }
+
+      closeEditModal(true);
+      await loadWorkspace('refresh');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '정보를 수정하지 못했습니다.';
+      Alert.alert('수정 실패', message);
+    } finally {
+      setIsSubmittingEdit(false);
+    }
+  };
+
+  const deleteEditingItem = async () => {
+    if (!editingItem) return;
+
+    setIsSubmittingEdit(true);
+    try {
+      if (editingItem.type === 'folder') {
+        await deleteWorkspaceFolder(editingItem.id);
+        if (activeFolderId === editingItem.id) {
+          setActiveFolderId('all');
+        }
+      } else {
+        await deleteWorkspaceFile(editingItem.id);
+      }
+
+      closeEditModal(true);
+      await loadWorkspace('refresh');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '삭제하지 못했습니다.';
+      Alert.alert('삭제 실패', message);
+    } finally {
+      setIsSubmittingEdit(false);
+    }
   };
 
   const submitCreate = async () => {
@@ -264,7 +493,10 @@ export default function WorkfolderScreen() {
     <SafeAreaView style={styles.root}>
       <View style={styles.app}>
         <View style={[styles.rail, { width: layout.railWidth }]}>
-          <Pressable onPress={() => router.push('/')}>
+          <Pressable onPress={() => {
+            DeviceEventEmitter.emit('globalRefresh');
+            router.push('/');
+          }}>
             <Image
               source={require('@/assets/groupchat/logo.png')}
               style={[
@@ -281,7 +513,7 @@ export default function WorkfolderScreen() {
           <View style={styles.railNav}>
             <RailIcon name="add" onPress={() => openCreateModal('file')} />
             <RailIcon name="folder-open" active />
-            <RailIcon name="calendar-today" />
+            <RailIcon name="calendar-today" onPress={() => router.push('/calendar')} />
           </View>
         </View>
 
@@ -302,12 +534,42 @@ export default function WorkfolderScreen() {
 
             <View style={styles.folderHeader}>
               <Text style={styles.folderHeaderText}>폴더</Text>
-              <Pressable onPress={() => openCreateModal('folder')} style={styles.folderAddButton}>
+              <Pressable onPress={startInlineFolderCreate} style={styles.folderAddButton}>
                 <MaterialIcons name="add" size={20} color="#F7F7F8" />
               </Pressable>
             </View>
 
             <View style={styles.folderList}>
+              {isCreatingFolderInline && (
+                <View style={styles.folderCreateRow}>
+                  <MaterialIcons name="folder" size={20} color="rgba(255,255,255,0.86)" />
+                  <TextInput
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    autoFocus
+                    editable={!isSubmittingFolderCreate}
+                    onBlur={() => {
+                      void commitInlineFolderCreate();
+                    }}
+                    onChangeText={setDraftFolderName}
+                    onSubmitEditing={() => {
+                      void commitInlineFolderCreate();
+                    }}
+                    placeholder="폴더 이름"
+                    placeholderTextColor="rgba(247,247,248,0.62)"
+                    returnKeyType="done"
+                    style={styles.folderCreateInput}
+                    value={draftFolderName}
+                  />
+                  <Pressable
+                    onPress={cancelInlineFolderCreate}
+                    onPressIn={cancelInlineFolderCreate}
+                    style={styles.folderCreateCancelButton}>
+                    <MaterialIcons name="close" size={18} color="rgba(255,255,255,0.72)" />
+                  </Pressable>
+                </View>
+              )}
+
               {folders.map((folder) => (
                 <Pressable
                   key={folder.id}
@@ -321,6 +583,16 @@ export default function WorkfolderScreen() {
                     {folder.name}
                   </Text>
                   <Text style={styles.folderCount}>{folder.count}</Text>
+                  {!folder.isDefaultFolder && !isDefaultFolderName(folder.name) ? (
+                    <Pressable
+                      onPress={(event) => {
+                        event.stopPropagation();
+                        openFolderEditModal(folder);
+                      }}
+                      style={styles.folderMoreButton}>
+                      <MaterialIcons name="more-horiz" size={19} color="rgba(255,255,255,0.56)" />
+                    </Pressable>
+                  ) : null}
                 </Pressable>
               ))}
             </View>
@@ -410,6 +682,7 @@ export default function WorkfolderScreen() {
                         item={item}
                         selected={selectedIds.has(item.id)}
                         onToggle={() => toggleSelected(item.id)}
+                        onOpenEdit={() => openFileEditModal(item)}
                         onOpen={() => openWorkspaceItem(item)}
                       />
                     ))
@@ -422,7 +695,7 @@ export default function WorkfolderScreen() {
               <View style={styles.gridWrap}>
                 <Pressable
                   onPress={() => openCreateModal('file')}
-                  style={styles.createCard}>
+                  style={[styles.createCard, gridCardSizeStyle]}>
                   <View style={styles.createIcon}>
                     <MaterialIcons name="add" size={26} color="#355CFF" />
                   </View>
@@ -431,8 +704,10 @@ export default function WorkfolderScreen() {
 
                 {filteredItems.map((item) => (
                   <WorkGridCard
+                    cardStyle={gridCardSizeStyle}
                     key={item.id}
                     item={item}
+                    onOpenEdit={() => openFileEditModal(item)}
                     onOpen={() => openWorkspaceItem(item)}
                   />
                 ))}
@@ -455,6 +730,24 @@ export default function WorkfolderScreen() {
         onSubmit={submitCreate}
         selectedColor={selectedColor}
         selectedTag={selectedTag}
+      />
+
+      <EditWorkspaceModal
+        customTag={editingCustomTag}
+        isCustomTagInputOpen={isEditingCustomTagOpen}
+        isSubmitting={isSubmittingEdit}
+        item={editingItem}
+        name={editingName}
+        onChangeCustomTag={updateEditingCustomTag}
+        onChangeName={setEditingName}
+        onClose={() => closeEditModal()}
+        onDelete={deleteEditingItem}
+        onSelectColor={setEditingColor}
+        onSelectTag={selectEditingTag}
+        onSubmit={submitEdit}
+        onToggleCustomTag={() => setIsEditingCustomTagOpen((isOpen) => !isOpen)}
+        selectedColor={editingColor}
+        selectedTag={editingTag}
       />
     </SafeAreaView>
   );
@@ -570,6 +863,140 @@ function CreateWorkspaceModal({
   );
 }
 
+function EditWorkspaceModal({
+  customTag,
+  isCustomTagInputOpen,
+  isSubmitting,
+  item,
+  name,
+  onChangeCustomTag,
+  onChangeName,
+  onClose,
+  onDelete,
+  onSelectColor,
+  onSelectTag,
+  onSubmit,
+  onToggleCustomTag,
+  selectedColor,
+  selectedTag,
+}: {
+  customTag: string;
+  isCustomTagInputOpen: boolean;
+  isSubmitting: boolean;
+  item: EditableWorkspaceItem | null;
+  name: string;
+  onChangeCustomTag: (value: string) => void;
+  onChangeName: (value: string) => void;
+  onClose: () => void;
+  onDelete: () => void;
+  onSelectColor: (value: string) => void;
+  onSelectTag: (value: string) => void;
+  onSubmit: () => void;
+  onToggleCustomTag: () => void;
+  selectedColor: string;
+  selectedTag: string;
+}) {
+  const isFileMode = item?.type === 'file';
+  const shouldShowCustomTagInput = isCustomTagInputOpen || customTag.trim().length > 0;
+
+  return (
+    <Modal animationType="fade" transparent visible={Boolean(item)} onRequestClose={onClose}>
+      <Pressable onPress={onClose} style={styles.modalBackdrop}>
+        <Pressable style={styles.createModalCard}>
+          <Text style={styles.modalTitle}>{isFileMode ? '파일 정보 수정' : '폴더 정보 수정'}</Text>
+          <Text style={styles.modalDescription}>
+            {isFileMode
+              ? '이름과 색상을 변경하거나 파일을 삭제할 수 있습니다.'
+              : '이름과 색상을 변경하거나 폴더를 삭제할 수 있습니다.'}
+          </Text>
+
+          <Text style={styles.inputLabel}>{isFileMode ? '파일 이름' : '폴더 이름'}</Text>
+          <TextInput
+            autoCapitalize="none"
+            autoCorrect={false}
+            editable={!isSubmitting}
+            onChangeText={onChangeName}
+            placeholder={isFileMode ? '파일 이름 입력' : '폴더 이름 입력'}
+            placeholderTextColor="#A3A8B2"
+            style={styles.textInput}
+            value={name}
+          />
+
+          {isFileMode ? (
+            <>
+              <Text style={styles.inputLabel}>태그</Text>
+              <View style={styles.chipRow}>
+                {fileTags.map((tag) => (
+                  <Pressable
+                    disabled={isSubmitting}
+                    key={tag}
+                    onPress={() => onSelectTag(tag)}
+                    style={[styles.tagChip, !customTag && selectedTag === tag && styles.tagChipActive]}>
+                    <Text style={[styles.tagChipText, !customTag && selectedTag === tag && styles.tagChipTextActive]}>
+                      {tag}
+                    </Text>
+                  </Pressable>
+                ))}
+                <Pressable
+                  disabled={isSubmitting}
+                  onPress={onToggleCustomTag}
+                  style={[styles.tagChip, styles.tagAddChip, shouldShowCustomTagInput && styles.tagChipActive]}>
+                  <MaterialIcons name="add" size={18} color={shouldShowCustomTagInput ? '#FFFFFF' : '#6B7280'} />
+                </Pressable>
+              </View>
+
+              {shouldShowCustomTagInput ? (
+                <TextInput
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  editable={!isSubmitting}
+                  onChangeText={onChangeCustomTag}
+                  placeholder="직접 태그 입력"
+                  placeholderTextColor="#A3A8B2"
+                  style={[styles.textInput, styles.compactTextInput]}
+                  value={customTag}
+                />
+              ) : null}
+            </>
+          ) : null}
+
+          <Text style={styles.inputLabel}>테마 색상</Text>
+          <View style={styles.colorRow}>
+            {themeColors.map((color) => (
+              <Pressable
+                disabled={isSubmitting}
+                key={color}
+                onPress={() => onSelectColor(color)}
+                style={[
+                  styles.colorSwatch,
+                  { backgroundColor: color },
+                  selectedColor === color && styles.colorSwatchActive,
+                ]}
+              />
+            ))}
+          </View>
+
+          <View style={styles.modalActions}>
+            <Pressable disabled={isSubmitting} onPress={onClose} style={styles.cancelButton}>
+              <Text style={styles.cancelButtonText}>취소</Text>
+            </Pressable>
+            <Pressable disabled={isSubmitting} onPress={onDelete} style={styles.deleteButton}>
+              <Text style={styles.deleteButtonText}>삭제</Text>
+            </Pressable>
+            <Pressable disabled={isSubmitting} onPress={onSubmit} style={styles.submitButton}>
+              {isSubmitting ? (
+                <ActivityIndicator color="#FFFFFF" size="small" />
+              ) : (
+                <Text style={styles.submitButtonText}>변경</Text>
+              )}
+            </Pressable>
+          </View>
+        </Pressable>
+      </Pressable>
+    </Modal>
+  );
+}
+
 function RailIcon({
   name,
   active,
@@ -634,11 +1061,13 @@ function EmptyState() {
 function WorkRow({
   item,
   selected,
+  onOpenEdit,
   onToggle,
   onOpen,
 }: {
   item: WorkItem;
   selected: boolean;
+  onOpenEdit: () => void;
   onToggle: () => void;
   onOpen: () => void;
 }) {
@@ -676,12 +1105,29 @@ function WorkRow({
         {item.date}
       </Text>
 
-      <MaterialIcons name="more-horiz" size={22} color="#8A8F98" />
+      <Pressable
+        onPress={(event) => {
+          event.stopPropagation();
+          onOpenEdit();
+        }}
+        style={styles.rowMoreButton}>
+        <MaterialIcons name="more-horiz" size={22} color="#8A8F98" />
+      </Pressable>
     </Pressable>
   );
 }
 
-function WorkGridCard({ item, onOpen }: { item: WorkItem; onOpen: () => void }) {
+function WorkGridCard({
+  cardStyle,
+  item,
+  onOpenEdit,
+  onOpen,
+}: {
+  cardStyle: { height: number; width: number };
+  item: WorkItem;
+  onOpenEdit: () => void;
+  onOpen: () => void;
+}) {
   const icon = item.type === 'folder' ? 'folder' : item.tag === '회의' ? 'groups' : 'article';
 
   return (
@@ -689,13 +1135,21 @@ function WorkGridCard({ item, onOpen }: { item: WorkItem; onOpen: () => void }) 
       onPress={onOpen}
       style={[
         styles.gridCard,
+        cardStyle,
         {
           backgroundColor: colorWithAlpha(item.color, 0.13),
         },
       ]}>
       <View style={styles.gridActions}>
         <MaterialIcons name={item.starred ? 'star' : 'star-border'} size={19} color="#F4B400" />
-        <MaterialIcons name="more-vert" size={19} color="#7D8490" />
+        <Pressable
+          onPress={(event) => {
+            event.stopPropagation();
+            onOpenEdit();
+          }}
+          style={styles.gridMoreButton}>
+          <MaterialIcons name="more-vert" size={19} color="#7D8490" />
+        </Pressable>
       </View>
 
       <View style={[styles.gridIcon, { backgroundColor: 'rgba(255,255,255,0.68)' }]}>
@@ -829,6 +1283,34 @@ const styles = StyleSheet.create({
     marginTop: 4,
     gap: 8,
   },
+  folderCreateRow: {
+    height: 52,
+    borderRadius: 18,
+    backgroundColor: '#27282E',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingHorizontal: 12,
+    shadowColor: '#302A3A',
+    shadowOpacity: 0.08,
+    shadowRadius: 28,
+    shadowOffset: { width: 0, height: 14 },
+  },
+  folderCreateInput: {
+    flex: 1,
+    minWidth: 0,
+    color: '#F7F7F8',
+    fontSize: 15,
+    fontWeight: '900',
+    padding: 0,
+  },
+  folderCreateCancelButton: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   folderItem: {
     height: 52,
     borderRadius: 18,
@@ -850,6 +1332,13 @@ const styles = StyleSheet.create({
     color: 'rgba(255,255,255,0.46)',
     fontSize: 14,
     fontWeight: '900',
+  },
+  folderMoreButton: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   mainShell: {
     flex: 1,
@@ -1161,13 +1650,19 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '900',
   },
+  rowMoreButton: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   gridWrap: {
     flexDirection: 'row',
     flexWrap: 'wrap',
-    gap: 14,
+    gap: GRID_GAP,
   },
   createCard: {
-    aspectRatio: 1.22,
     borderRadius: 18,
     borderWidth: 1,
     borderColor: 'rgba(207,215,229,0.88)',
@@ -1179,7 +1674,6 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.035,
     shadowRadius: 42,
     shadowOffset: { width: 0, height: 18 },
-    width: '31%',
   },
   createIcon: {
     width: 56,
@@ -1195,7 +1689,6 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   gridCard: {
-    aspectRatio: 1.22,
     position: 'relative',
     borderRadius: 18,
     borderWidth: 1,
@@ -1206,14 +1699,21 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.05,
     shadowRadius: 42,
     shadowOffset: { width: 0, height: 18 },
-    width: '31%',
   },
   gridActions: {
     position: 'absolute',
     top: 14,
     right: 14,
     flexDirection: 'row',
+    alignItems: 'center',
     gap: 12,
+  },
+  gridMoreButton: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   gridIcon: {
     width: 48,
@@ -1300,6 +1800,9 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     paddingHorizontal: 14,
   },
+  compactTextInput: {
+    marginBottom: 2,
+  },
   chipRow: {
     flexDirection: 'row',
     flexWrap: 'wrap',
@@ -1315,6 +1818,11 @@ const styles = StyleSheet.create({
   },
   tagChipActive: {
     backgroundColor: '#111318',
+  },
+  tagAddChip: {
+    width: 34,
+    alignItems: 'center',
+    paddingHorizontal: 0,
   },
   tagChipText: {
     color: '#6B7280',
@@ -1364,6 +1872,20 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     backgroundColor: '#111318',
     paddingHorizontal: 22,
+  },
+  deleteButton: {
+    minWidth: 92,
+    height: 46,
+    borderRadius: 23,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#FDE8E8',
+    paddingHorizontal: 22,
+  },
+  deleteButtonText: {
+    color: '#EF4444',
+    fontSize: 15,
+    fontWeight: '900',
   },
   submitButtonText: {
     color: '#FFFFFF',
