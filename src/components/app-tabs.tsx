@@ -47,6 +47,13 @@ export default function AppTabs() {
       />
 
       <Tabs.Screen
+        name="calendar"
+        options={{
+          href: null,
+        }}
+      />
+
+      <Tabs.Screen
         name="explore"
         options={{
           title: 'Explore',
