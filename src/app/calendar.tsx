@@ -2,10 +2,8 @@ import MaterialIcons from '@expo/vector-icons/MaterialIcons';
 import { useFocusEffect, useRouter } from 'expo-router';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  ActivityIndicator,
   Image,
   Pressable,
-  RefreshControl,
   SafeAreaView,
   ScrollView,
   StyleSheet,
@@ -41,8 +39,6 @@ type CalendarDay = {
   schedules: ScheduleItem[];
 };
 
-type LoadMode = 'initial' | 'refresh';
-
 const weekLabels = ['일', '월', '화', '수', '목', '금', '토'];
 
 export default function CalendarScreen() {
@@ -53,20 +49,22 @@ export default function CalendarScreen() {
   const [activeMonthDate, setActiveMonthDate] = useState(() => new Date(today.getFullYear(), today.getMonth(), 1));
   const [selectedDateKey, setSelectedDateKey] = useState(todayKey);
   const [schedules, setSchedules] = useState<ScheduleItem[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
-  const [isRefreshing, setIsRefreshing] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   const layout = useMemo(() => {
     const railWidth = clamp(width * 0.052, 72, 88);
+    const shellGap = clamp(width * 0.014, 16, 24);
+    const canvasRadius = clamp(width * 0.024, 28, 42);
     const mainPadding = clamp(width * 0.026, 30, 48);
     const sideWidth = clamp(width * 0.25, 320, 390);
     const calendarCellHeight = clamp((height - 258) / 6, 82, 112);
 
     return {
       calendarCellHeight,
+      canvasRadius,
       mainPadding,
       railWidth,
+      shellGap,
       sideWidth,
     };
   }, [height, width]);
@@ -94,32 +92,26 @@ export default function CalendarScreen() {
   const currentMonthLabel = `${activeMonthDate.getFullYear()}년 ${activeMonthDate.getMonth() + 1}월`;
   const confirmedCount = visibleSchedules.filter((item) => item.status === 'confirmed').length;
 
-  const loadSchedules = useCallback(async (mode: LoadMode = 'initial') => {
+  const loadSchedules = useCallback(async () => {
     try {
-      if (mode === 'refresh') setIsRefreshing(true);
-      else setIsLoading(true);
-
       setErrorMessage(null);
       setSchedules(await fetchSchedules());
     } catch (error) {
       const message = error instanceof Error ? error.message : '일정을 불러오지 못했습니다.';
       setErrorMessage(message);
       setSchedules([]);
-    } finally {
-      setIsLoading(false);
-      setIsRefreshing(false);
     }
   }, []);
 
   useFocusEffect(
     useCallback(() => {
-      loadSchedules('refresh');
+      loadSchedules();
     }, [loadSchedules])
   );
 
   useEffect(() => {
     const subscription = DeviceEventEmitter.addListener('globalRefresh', () => {
-      loadSchedules('refresh');
+      loadSchedules();
     });
     
     return () => subscription.remove();
@@ -158,13 +150,13 @@ export default function CalendarScreen() {
     } catch (error) {
       const message = error instanceof Error ? error.message : '일정 상태를 바꾸지 못했습니다.';
       setErrorMessage(message);
-      loadSchedules('refresh');
+      loadSchedules();
     }
   };
 
   return (
     <SafeAreaView style={styles.root}>
-      <View style={styles.app}>
+      <View style={[styles.app, { gap: layout.shellGap }]}>
         <View style={[styles.rail, { width: layout.railWidth }]}>
           <Pressable onPress={() => {
             DeviceEventEmitter.emit('globalRefresh');
@@ -190,17 +182,10 @@ export default function CalendarScreen() {
           </View>
         </View>
 
-        <View style={styles.pageShell}>
+        <View style={[styles.pageShell, { borderRadius: layout.canvasRadius }]}>
           <ScrollView
             bounces={false}
-            style={{ borderRadius: 36, overflow: 'hidden' }}
-            refreshControl={(
-              <RefreshControl
-                refreshing={isRefreshing}
-                tintColor="#111318"
-                onRefresh={() => loadSchedules('refresh')}
-              />
-            )}
+            style={{ borderRadius: layout.canvasRadius, overflow: 'hidden' }}
             showsVerticalScrollIndicator={false}
             contentContainerStyle={[
               styles.pageContent,
@@ -212,19 +197,12 @@ export default function CalendarScreen() {
             <View style={styles.pageHeader}>
               <View style={styles.titleBlock}>
                 <Text style={styles.title}>캘린더</Text>
-                <Text style={styles.subtitle}>
+                <Text numberOfLines={1} style={styles.titleMeta}>
                   예정 {confirmedCount}개 · 확인 대기 {pendingSchedules.length}개
                 </Text>
               </View>
 
               <View style={styles.headerActions}>
-                <Pressable onPress={() => loadSchedules('refresh')} style={styles.iconButton}>
-                  {isRefreshing ? (
-                    <ActivityIndicator color="#1D1D1F" size="small" />
-                  ) : (
-                    <MaterialIcons name="refresh" size={22} color="#1D1D1F" />
-                  )}
-                </Pressable>
                 <Pressable onPress={moveToday} style={styles.todayButton}>
                   <MaterialIcons name="today" size={18} color="#FFFFFF" />
                   <Text style={styles.todayText}>오늘</Text>
@@ -244,7 +222,7 @@ export default function CalendarScreen() {
               <View style={styles.statusBanner}>
                 <MaterialIcons name="cloud-off" size={20} color="#A33B00" />
                 <Text numberOfLines={2} style={styles.statusText}>{errorMessage}</Text>
-                <Pressable onPress={() => loadSchedules('refresh')} style={styles.retryButton}>
+                <Pressable onPress={loadSchedules} style={styles.retryButton}>
                   <Text style={styles.retryText}>다시 시도</Text>
                 </Pressable>
               </View>
@@ -315,12 +293,6 @@ export default function CalendarScreen() {
                   ))}
                 </View>
 
-                {isLoading ? (
-                  <View style={styles.loadingOverlay}>
-                    <ActivityIndicator color="#1D1D1F" />
-                    <Text style={styles.loadingText}>일정을 불러오는 중...</Text>
-                  </View>
-                ) : null}
               </View>
 
               <View style={[styles.sidePanel, { width: layout.sideWidth }]}>
@@ -554,6 +526,10 @@ const styles = StyleSheet.create({
   app: {
     flex: 1,
     flexDirection: 'row',
+    paddingBottom: 5,
+    paddingLeft: 4,
+    paddingRight: 20,
+    paddingTop: 5,
   },
   calendarGrid: {
     borderColor: '#EEF1F6',
@@ -693,14 +669,6 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     gap: 10,
   },
-  iconButton: {
-    alignItems: 'center',
-    backgroundColor: '#FFFFFF',
-    borderRadius: 24,
-    height: 48,
-    justifyContent: 'center',
-    width: 48,
-  },
   legend: {
     alignItems: 'center',
     flexDirection: 'row',
@@ -720,20 +688,6 @@ const styles = StyleSheet.create({
     color: '#6B7280',
     fontFamily: FontFamily.extraBold,
     fontSize: 12,
-    fontWeight: 'normal',
-  },
-  loadingOverlay: {
-    ...StyleSheet.absoluteFillObject,
-    alignItems: 'center',
-    backgroundColor: 'rgba(255,255,255,0.76)',
-    borderRadius: 24,
-    gap: 10,
-    justifyContent: 'center',
-  },
-  loadingText: {
-    color: '#8A8F98',
-    fontFamily: FontFamily.semiBold,
-    fontSize: 14,
     fontWeight: 'normal',
   },
   logo: {
@@ -780,21 +734,14 @@ const styles = StyleSheet.create({
     flexGrow: 1,
   },
   pageHeader: {
-    alignItems: 'flex-start',
+    alignItems: 'center',
     flexDirection: 'row',
     justifyContent: 'space-between',
-    marginBottom: 26,
+    marginBottom: 18,
   },
   pageShell: {
     backgroundColor: '#F6F7FA',
-    borderBottomLeftRadius: 36,
-    borderTopLeftRadius: 36,
-    borderBottomRightRadius: 36,
-    borderTopRightRadius: 36,
     flex: 1,
-    marginBottom: 18,
-    marginRight: 18,
-    marginTop: 18,
     overflow: 'hidden',
   },
   pendingBody: {
@@ -870,7 +817,7 @@ const styles = StyleSheet.create({
     fontWeight: 'normal',
   },
   root: {
-    backgroundColor: '#050506',
+    backgroundColor: '#000000',
     flex: 1,
   },
   scheduleActions: {
@@ -1059,12 +1006,12 @@ const styles = StyleSheet.create({
     fontWeight: 'normal',
     lineHeight: 17,
   },
-  subtitle: {
+  titleMeta: {
     color: '#8A8F98',
     fontFamily: FontFamily.semiBold,
     fontSize: 15,
     fontWeight: 'normal',
-    marginTop: 8,
+    marginTop: 4,
   },
   title: {
     color: '#1D1D1F',
@@ -1074,7 +1021,10 @@ const styles = StyleSheet.create({
     lineHeight: 44,
   },
   titleBlock: {
+    alignItems: 'center',
+    flexDirection: 'row',
     flexShrink: 1,
+    gap: 14,
     minWidth: 0,
   },
   todayButton: {

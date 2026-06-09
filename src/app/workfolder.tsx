@@ -160,13 +160,14 @@ export default function WorkfolderScreen() {
 
   const layout = useMemo(() => {
     const railWidth = clamp(width * 0.052, 72, 88);
+    const shellGap = clamp(width * 0.014, 16, 24);
     const sidebarWidth = clamp(width * 0.16, 230, 300);
     const mainPadding = clamp(width * 0.034, 40, 64);
-    const contentWidth = width - railWidth - sidebarWidth - 18 - mainPadding * 2;
+    const contentWidth = width - 24 - railWidth - shellGap - sidebarWidth - 18 - mainPadding * 2;
     const maxGridCardWidth = (contentWidth - GRID_GAP * (GRID_COLUMN_COUNT - 1)) / GRID_COLUMN_COUNT;
     const gridCardWidth = clamp(contentWidth * GRID_CARD_WIDTH_RATIO, 220, maxGridCardWidth);
     const gridCardHeight = gridCardWidth / GRID_CARD_ASPECT_RATIO;
-    return { railWidth, sidebarWidth, mainPadding, gridCardWidth, gridCardHeight };
+    return { railWidth, shellGap, sidebarWidth, mainPadding, gridCardWidth, gridCardHeight };
   }, [width]);
 
   const gridCardSizeStyle = useMemo(
@@ -491,7 +492,7 @@ export default function WorkfolderScreen() {
 
   return (
     <SafeAreaView style={styles.root}>
-      <View style={styles.app}>
+      <View style={[styles.app, { gap: layout.shellGap }]}>
         <View style={[styles.rail, { width: layout.railWidth }]}>
           <Pressable onPress={() => {
             DeviceEventEmitter.emit('globalRefresh');
@@ -1203,12 +1204,16 @@ function clamp(value: number, min: number, max: number) {
 const styles = StyleSheet.create({
   root: {
     flex: 1,
-    backgroundColor: '#050506',
+    backgroundColor: '#000000',
   },
   app: {
     flex: 1,
     flexDirection: 'row',
-    backgroundColor: '#050506',
+    backgroundColor: '#000000',
+    paddingBottom: 5,
+    paddingLeft: 4,
+    paddingRight: 20,
+    paddingTop: 5,
   },
   rail: {
     backgroundColor: '#050506',
