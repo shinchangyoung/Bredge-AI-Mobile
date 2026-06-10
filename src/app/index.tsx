@@ -324,9 +324,7 @@ export default function HomeScreen() {
         <View style={[styles.canvas, { borderRadius: layout.canvasRadius }]}>
           <GridOverlay />
 
-          <Pressable style={styles.notificationButton}>
-            <MaterialIcons name="notifications-none" size={24} color="#1D1D1F" />
-          </Pressable>
+
 
           {isChatMode ? (
             <View style={styles.webChatStage}>

@@ -645,9 +645,6 @@ export default function WorkfolderScreen() {
                   <Text style={styles.newFileText}>새 파일</Text>
                 </Pressable>
 
-                <Pressable style={styles.bellButton}>
-                  <MaterialIcons name="notifications-none" size={20} color="#050506" />
-                </Pressable>
               </View>
             </View>
 
