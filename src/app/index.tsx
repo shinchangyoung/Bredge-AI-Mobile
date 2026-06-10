@@ -177,7 +177,6 @@ export default function HomeScreen() {
                   {isRecentLoading ? (
                     <View style={[styles.recentStatusCard, { height: layout.recentCardHeight }]}>
                       <ActivityIndicator color="#1D1D1F" />
-                      <Text style={styles.recentStatusText}>최근 파일을 불러오는 중...</Text>
                     </View>
                   ) : recentFiles.length > 0 ? (
                     recentFiles.map((file) => (

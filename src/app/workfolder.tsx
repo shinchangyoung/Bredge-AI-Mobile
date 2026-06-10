@@ -584,7 +584,7 @@ export default function WorkfolderScreen() {
                     {folder.name}
                   </Text>
                   <Text style={styles.folderCount}>{folder.count}</Text>
-                  {!folder.isDefaultFolder && !isDefaultFolderName(folder.name) ? (
+                  {!folder.isDefaultFolder && !isDefaultFolderName(folder.name) && activeFolderId === folder.id ? (
                     <Pressable
                       onPress={(event) => {
                         event.stopPropagation();
@@ -664,7 +664,6 @@ export default function WorkfolderScreen() {
             {isLoading ? (
               <View style={styles.loadingBox}>
                 <ActivityIndicator color="#1D1D1F" />
-                <Text style={styles.loadingText}>DB 세션 파일을 불러오는 중...</Text>
               </View>
             ) : viewMode === 'list' ? (
               <View style={styles.listShell}>

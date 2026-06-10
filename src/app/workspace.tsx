@@ -13,7 +13,7 @@ import * as DocumentPicker from 'expo-document-picker';
 import { Directory, File, Paths } from 'expo-file-system';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import LottieView from 'lottie-react-native';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -23,6 +23,7 @@ import {
   Platform,
   SafeAreaView,
   ScrollView,
+  FlatList,
   StyleSheet,
   Text,
   TextInput,
@@ -57,6 +58,8 @@ import {
   type PenType,
 } from '@/lib/pdf-annotations';
 import { createPdfViewerHtml } from '@/lib/pdf-viewer-html';
+import { startChatStream, ChatMessageItem } from '@/lib/chat-api';
+import CitationInlineText from '@/components/workspace/CitationInlineText';
 import {
   appendMaterialToSessionWeeks,
   buildSessionSourceGroups,
@@ -361,6 +364,11 @@ export default function WorkspaceScreen() {
   const audioPlayerStatus = useAudioPlayerStatus(audioPlayer);
   const [activeTab, setActiveTab] = useState<MainTab>('materials');
   const [aiInput, setAiInput] = useState('');
+  const [messages, setMessages] = useState<ChatMessageItem[]>([]);
+  const [isSending, setIsSending] = useState(false);
+  const transcriptListRef = useRef<FlatList>(null);
+  const chatScrollRef = useRef<ScrollView>(null);
+  const stopChatStreamRef = useRef<(() => void) | null>(null);
   const [isAiCollapsed, setIsAiCollapsed] = useState(true);
   const [scriptPaneWidth, setScriptPaneWidth] = useState<number | null>(null);
   const [aiPanelWidth, setAiPanelWidth] = useState<number | null>(null);
@@ -571,6 +579,20 @@ export default function WorkspaceScreen() {
       null
     );
   }, [playbackCurrentTime, playbackRecordingId, selectedRecordingId, selectedTranscriptLineId, transcriptLines]);
+
+  useEffect(() => {
+    if (activeTranscriptLineId && transcriptListRef.current && transcriptLines.length > 0) {
+      const index = transcriptLines.findIndex((line) => line.id === activeTranscriptLineId);
+      if (index !== -1) {
+        try {
+          transcriptListRef.current.scrollToIndex({ index, animated: true, viewPosition: 0.5 });
+        } catch (e) {
+          // ignore scroll errors if items are not yet rendered
+        }
+      }
+    }
+  }, [activeTranscriptLineId, transcriptLines]);
+
   const recordingTranscriptStates = useMemo<Record<string, RecordingTranscriptState>>(() => {
     const states: Record<string, RecordingTranscriptState> = {};
 
@@ -1450,6 +1472,126 @@ export default function WorkspaceScreen() {
     });
   };
 
+  const handleCitationClick = useCallback((citation: any) => {
+    console.log('Citation clicked:', citation);
+  }, []);
+
+  const handleSourceView = useCallback((citation: any) => {
+    // Navigate to the source - scroll to transcript or highlight material
+    const raw = citation.raw || citation;
+    if (raw.session_id) {
+      console.log('[SourceView] Navigate to session:', raw.session_id, 'recording:', raw.recording_id);
+      // If transcript type, try to find and scroll to the matching transcript line
+      if (raw.start_time != null) {
+        const startTime = Number(raw.start_time);
+        const targetLine = transcriptLines.find((line) => {
+          const lineStart = Number(line.startTime ?? line.start ?? 0);
+          return lineStart >= startTime;
+        });
+        if (targetLine) {
+          // Select the transcript line to trigger scroll-into-view
+          setSelectedTranscriptLineId(targetLine.id);
+          // Also start playback at this position if a recording is loaded
+          if (raw.recording_id) {
+            setSelectedRecordingId(raw.recording_id);
+          }
+        }
+      }
+    }
+  }, [transcriptLines]);
+
+  const sendMessage = useCallback(() => {
+    const question = aiInput.trim();
+    if (!question || isSending) return;
+
+    setIsSending(true);
+    setAiInput('');
+    
+    setMessages((prev) => [
+      ...prev,
+      { role: 'user', text: question },
+      { role: 'ai', text: '', phase: 'analyzing', statusText: '질문 분석 중', citations: [] }
+    ]);
+
+    const sourceFilterIds = Array.from(selectedSourceIds);
+    const sourceFilterObj: Record<string, unknown> | null =
+      sourceFilterIds.length > 0
+        ? Object.fromEntries(sourceFilterIds.map((id) => [id, true]))
+        : null;
+    
+    stopChatStreamRef.current = startChatStream(
+      {
+        question,
+        is_thinking: false,
+        session_id: sessionId ?? null,
+        source_filter: sourceFilterObj,
+      },
+      {
+        onStatus: (phase, message) => {
+          setMessages((prev) => {
+            const next = [...prev];
+            const last = next[next.length - 1];
+            if (last && last.role === 'ai') {
+              last.phase = phase;
+              last.statusText = message;
+            }
+            return next;
+          });
+        },
+        onCitations: (citations) => {
+          setMessages((prev) => {
+            const next = [...prev];
+            const last = next[next.length - 1];
+            if (last && last.role === 'ai') {
+              last.citations = citations;
+            }
+            return next;
+          });
+        },
+        onToken: (token) => {
+          setMessages((prev) => {
+            const next = [...prev];
+            const last = next[next.length - 1];
+            if (last && last.role === 'ai') {
+              last.phase = 'answering';
+              last.text += token;
+            }
+            return next;
+          });
+        },
+        onError: (error) => {
+          setMessages((prev) => {
+            const next = [...prev];
+            const last = next[next.length - 1];
+            if (last && last.role === 'ai') {
+              last.phase = 'done';
+              last.text += `\n\n오류: ${error}`;
+            }
+            return next;
+          });
+          setIsSending(false);
+        },
+        onDone: () => {
+          setMessages((prev) => {
+            const next = [...prev];
+            const last = next[next.length - 1];
+            if (last && last.role === 'ai') {
+              last.phase = 'done';
+            }
+            return next;
+          });
+          setIsSending(false);
+        }
+      }
+    )?.abort;
+  }, [aiInput, isSending, sessionId, selectedSourceIds]);
+
+  useEffect(() => {
+    return () => {
+      if (stopChatStreamRef.current) stopChatStreamRef.current();
+    };
+  }, []);
+
   const materialsPanel = (
     <MaterialsPanel
       currentPdf={currentPdf}
@@ -1596,14 +1738,24 @@ export default function WorkspaceScreen() {
                 </Text>
               </View>
             ) : transcriptLines.length > 0 ? (
-              <ScrollView
+              <FlatList
+                ref={transcriptListRef}
+                data={transcriptLines}
+                keyExtractor={(line) => line.id}
                 showsVerticalScrollIndicator={false}
-                contentContainerStyle={styles.transcriptList}>
-                {transcriptLines.map((line) => {
+                contentContainerStyle={styles.transcriptList}
+                onScrollToIndexFailed={(info) => {
+                  setTimeout(() => {
+                    try {
+                      transcriptListRef.current?.scrollToIndex({ index: info.index, animated: true, viewPosition: 0.5 });
+                    } catch (e) {}
+                  }, 100);
+                }}
+                renderItem={({ item: line }) => {
                   const isActiveLine = line.id === activeTranscriptLineId;
 
                   return (
-                    <View key={line.id} style={styles.transcriptItem}>
+                    <View style={styles.transcriptItem}>
                       <Pressable
                         onPress={() => handleTranscriptLinePress(line)}
                         style={styles.transcriptTimeButton}>
@@ -1622,8 +1774,8 @@ export default function WorkspaceScreen() {
                       </Pressable>
                     </View>
                   );
-                })}
-              </ScrollView>
+                }}
+              />
             ) : (
               <View style={styles.emptyScriptState}>
                 <LottieView
@@ -1810,15 +1962,66 @@ export default function WorkspaceScreen() {
               styles.aiPanel,
               { borderRadius: layout.radius, width: currentAiPanelWidth },
             ]}>
-              <View style={styles.aiCenter}>
-                <LottieView
-                  ref={chatbotAnimationRef}
-                  loop={false}
-                  resizeMode="contain"
-                  source={require('@/assets/groupchat/animations/Chatbot.json')}
-                  style={styles.chatbotAnimation}
-                />
-                <Text style={styles.aiPrompt}>무엇을 도와드릴까요?</Text>
+              <View style={{ flex: 1, position: 'relative' }}>
+                {messages.length === 0 ? (
+                  <View style={styles.aiCenter}>
+                    <LottieView
+                      ref={chatbotAnimationRef}
+                      loop={false}
+                      resizeMode="contain"
+                      source={require('@/assets/groupchat/animations/Chatbot.json')}
+                      style={styles.chatbotAnimation}
+                    />
+                    <Text style={styles.aiPrompt}>무엇을 도와드릴까요?</Text>
+                  </View>
+                ) : (
+                  <ScrollView
+                    ref={chatScrollRef}
+                    onContentSizeChange={() => chatScrollRef.current?.scrollToEnd({ animated: true })}
+                    style={{ flex: 1 }}
+                    contentContainerStyle={{ paddingHorizontal: 16, paddingVertical: 16, gap: 20, paddingBottom: 24 }}
+                    showsVerticalScrollIndicator={false}
+                  >
+                    {messages.map((msg, index) => (
+                      <View key={index}>
+                        {msg.role === 'user' ? (
+                          <View style={styles.chatRowUser}>
+                            <View style={styles.chatBubbleUser}>
+                              <Text style={styles.chatTextUser}>{msg.text}</Text>
+                            </View>
+                          </View>
+                        ) : (
+                          <View style={styles.chatRowAi}>
+                            {!!msg.text && (
+                              <CitationInlineText 
+                                text={msg.text} 
+                                citations={msg.citations} 
+                                enableCitations={msg.phase === 'done'}
+                                onCitationClick={handleCitationClick}
+                                onSourceView={handleSourceView}
+                                style={styles.chatTextAi}
+                              />
+                            )}
+                            
+                            {msg.phase && msg.phase !== 'done' && !msg.text && (
+                              <View style={styles.aiStreamWait}>
+                                <ActivityIndicator size="small" color="#3B82F6" style={{ marginRight: 6 }} />
+                                <Text style={styles.aiStreamStatusText}>{msg.statusText || '답변 준비 중...'}</Text>
+                              </View>
+                            )}
+                            
+                            {msg.phase && msg.phase !== 'done' && !!msg.text && (
+                              <View style={[styles.aiStreamWait, { marginTop: 8 }]}>
+                                <ActivityIndicator size="small" color="#3B82F6" style={{ marginRight: 6 }} />
+                                <Text style={styles.aiStreamStatusText}>{msg.statusText || '답변 생성 중...'}</Text>
+                              </View>
+                            )}
+                          </View>
+                        )}
+                      </View>
+                    ))}
+                  </ScrollView>
+                )}
               </View>
 
               <View style={styles.aiInputBox}>
@@ -1828,8 +2031,15 @@ export default function WorkspaceScreen() {
                   placeholder="무엇이든 물어보세요..."
                   placeholderTextColor="#A4A8B2"
                   style={styles.aiInput}
+                  onSubmitEditing={sendMessage}
+                  returnKeyType="send"
+                  multiline
                 />
-                <Pressable style={[styles.sendButton, aiInput.trim() && styles.sendButtonActive]}>
+                <Pressable 
+                  style={[styles.sendButton, aiInput.trim() && !isSending ? styles.sendButtonActive : null]}
+                  onPress={sendMessage}
+                  disabled={!aiInput.trim() || isSending}
+                >
                   <MaterialIcons name="arrow-upward" size={22} color="#FFFFFF" />
                 </Pressable>
               </View>
@@ -2889,9 +3099,10 @@ const styles = StyleSheet.create({
     lineHeight: 30,
   },
   transcriptTextActive: {
-    backgroundColor: '#EAF2FF',
+    backgroundColor: '#E5F0FF',
     borderRadius: 6,
-    color: '#202329',
+    color: '#111827',
+    overflow: 'hidden',
   },
   scriptResizeHandle: {
     alignItems: 'center',
@@ -3865,6 +4076,47 @@ const styles = StyleSheet.create({
     borderRadius: 2,
     height: 42,
     width: 3,
+  },
+  chatRowUser: {
+    alignItems: 'flex-end',
+  },
+  chatBubbleUser: {
+    backgroundColor: '#2A2D3A',
+    borderRadius: 18,
+    borderBottomRightRadius: 4,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    maxWidth: '75%',
+  },
+  chatTextUser: {
+    color: '#FFFFFF',
+    fontSize: 15,
+    lineHeight: 22,
+    fontWeight: '500',
+  },
+  chatRowAi: {
+    alignItems: 'flex-start',
+    paddingRight: 8,
+  },
+  chatTextAi: {
+    color: '#1E293B',
+    fontSize: 15,
+    lineHeight: 26,
+  },
+  aiStreamWait: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(59, 130, 246, 0.08)',
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    alignSelf: 'flex-start',
+    marginTop: 4,
+  },
+  aiStreamStatusText: {
+    color: '#4B5563',
+    fontSize: 12,
+    fontWeight: 'bold',
   },
   aiCenter: {
     alignItems: 'center',
