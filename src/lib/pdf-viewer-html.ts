@@ -99,6 +99,28 @@ export function createPdfViewerHtml(pdfBase64: string, annotations: PdfAnnotatio
         width: 100%;
       }
 
+      .page-block.is-evidence-target .page-card {
+        border-color: #3b82f6;
+        box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.14);
+      }
+
+      .evidence-banner {
+        align-items: center;
+        background: #eff6ff;
+        border: 1px solid #bfdbfe;
+        border-radius: 999px;
+        color: #1d4ed8;
+        display: inline-flex;
+        font-size: 12px;
+        font-weight: 900;
+        gap: 8px;
+        left: 16px;
+        padding: 7px 12px;
+        position: absolute;
+        top: 16px;
+        z-index: 8;
+      }
+
       .pdf-canvas {
         display: block;
         pointer-events: none;
@@ -194,6 +216,35 @@ export function createPdfViewerHtml(pdfBase64: string, annotations: PdfAnnotatio
           ? Math.max(0, currentIndex - 1)
           : Math.min(pageBlocks.length - 1, currentIndex + 1);
         const targetBlock = pageBlocks[targetIndex];
+
+        viewer.scrollTo({
+          behavior: "smooth",
+          left: targetBlock.offsetLeft
+        });
+      };
+
+      window.scrollPdfToPage = function scrollPdfToPage(pageNumber) {
+        const pageBlocks = Array.from(document.querySelectorAll(".page-block"));
+        if (!pageBlocks.length) return;
+
+        const targetIndex = Math.min(Math.max(Number(pageNumber || 1), 1), pageBlocks.length) - 1;
+        const targetBlock = pageBlocks[targetIndex];
+        if (!targetBlock) return;
+
+        pageBlocks.forEach(function clearEvidence(block) {
+          block.classList.remove("is-evidence-target");
+          const oldBanner = block.querySelector(".evidence-banner");
+          if (oldBanner) oldBanner.remove();
+        });
+
+        targetBlock.classList.add("is-evidence-target");
+        const card = targetBlock.querySelector(".page-card");
+        if (card) {
+          const banner = document.createElement("div");
+          banner.className = "evidence-banner";
+          banner.textContent = "AI가 참조한 PDF 페이지 · p." + (targetIndex + 1);
+          card.prepend(banner);
+        }
 
         viewer.scrollTo({
           behavior: "smooth",

@@ -34,6 +34,7 @@ import {
 import { WebView } from 'react-native-webview';
 
 import { FontFamily } from '@/constants/fonts';
+import { useChatSessions } from '@/hooks/use-chat-sessions';
 import {
   getWorkspaceAssetUrl,
   getWorkspaceSession,
@@ -58,8 +59,8 @@ import {
   type PenType,
 } from '@/lib/pdf-annotations';
 import { createPdfViewerHtml } from '@/lib/pdf-viewer-html';
-import { startChatStream, ChatMessageItem } from '@/lib/chat-api';
-import CitationInlineText from '@/components/workspace/CitationInlineText';
+import { requestChatAnswer, startChatStream, ChatMessageItem } from '@/lib/chat-api';
+import CitationInlineText, { type NormalizedCitation } from '@/components/workspace/CitationInlineText';
 import {
   appendMaterialToSessionWeeks,
   buildSessionSourceGroups,
@@ -88,10 +89,15 @@ import {
 declare const require: (moduleName: string) => any;
 
 type MainTab = 'materials' | 'summary' | 'quiz';
-type PdfPageCommand = {
-  direction: 'next' | 'previous';
-  id: number;
-};
+type PdfPageCommand =
+  | {
+      direction: 'next' | 'previous';
+      id: number;
+    }
+  | {
+      id: number;
+      page: number;
+    };
 type DrawTool = {
   color: string;
   mode: DrawMode;
@@ -106,6 +112,14 @@ type RecordingTranscriptState = {
   hasTranscript: boolean;
   isFailed: boolean;
   isProcessing: boolean;
+};
+type WordInsight = {
+  desc: string;
+  error: string;
+  isLoading: boolean;
+  source: string;
+  visible: boolean;
+  word: string;
 };
 
 const tabs: { key: MainTab; label: string }[] = [
@@ -344,6 +358,57 @@ function waitForAudioSource(milliseconds = 120) {
   });
 }
 
+function cleanSelectedWord(word = '') {
+  return String(word)
+    .replace(/^[\s"'“”‘’()[\]{}.,!?;:，。！？、]+|[\s"'“”‘’()[\]{}.,!?;:，。！？、]+$/g, '')
+    .trim();
+}
+
+function buildWordExplanationQuestion(word: string, context = '') {
+  const contextText = context ? `\n이 단어가 나온 전사 문맥: "${context}"` : '';
+  return `"${word}"라는 단어의 뜻을 한국어로 쉽게 설명해줘.${contextText}\n답변은 반드시 위 문맥을 우선 반영해서 1문장으로 짧게 설명해줘.`;
+}
+
+function splitTranscriptTextTokens(text = '') {
+  return (String(text || '').match(/\s+|[^\s]+/g) ?? []).map((value, index) => ({
+    id: `${index}-${value}`,
+    isWord: /[0-9A-Za-z가-힣]/.test(cleanSelectedWord(value)),
+    value,
+  }));
+}
+
+function buildChatSourceFilter(selectedSourceIds: Set<string>, sourceItems: SessionSourceItem[]) {
+  const selectedSources = sourceItems.filter((source) => selectedSourceIds.has(source.uid));
+  if (!selectedSources.length) return null;
+
+  const materialIds = selectedSources
+    .filter((source) => source.kind === 'material' && source.materialId)
+    .map((source) => source.materialId as string);
+  const recordingIds = selectedSources
+    .filter((source) => source.kind === 'recording' && source.recordingId)
+    .map((source) => source.recordingId as string);
+
+  const sourceFilter: Record<string, string[]> = {};
+  if (materialIds.length) sourceFilter.material_ids = [...new Set(materialIds)];
+  if (recordingIds.length) sourceFilter.recording_ids = [...new Set(recordingIds)];
+
+  return Object.keys(sourceFilter).length ? sourceFilter : null;
+}
+
+function safeParseCitationParam(value?: string) {
+  if (!value) return null;
+
+  try {
+    return JSON.parse(value);
+  } catch {
+    try {
+      return JSON.parse(decodeURIComponent(value));
+    } catch {
+      return null;
+    }
+  }
+}
+
 const workspaceRecordingOptions = {
   ...RecordingPresets.HIGH_QUALITY,
   isMeteringEnabled: true,
@@ -355,17 +420,30 @@ if (Platform.OS === 'android') {
 
 export default function WorkspaceScreen() {
   const router = useRouter();
-  const params = useLocalSearchParams<{ sessionId?: string | string[] }>();
+  const params = useLocalSearchParams<{ citation?: string | string[]; sessionId?: string | string[] }>();
   const { width } = useWindowDimensions();
   const sessionId = Array.isArray(params.sessionId) ? params.sessionId[0] : params.sessionId;
+  const citationParam = Array.isArray(params.citation) ? params.citation[0] : params.citation;
   const audioRecorder = useAudioRecorder(workspaceRecordingOptions);
   const recorderState = useAudioRecorderState(audioRecorder, 250);
   const audioPlayer = useAudioPlayer(null, { updateInterval: 250 });
   const audioPlayerStatus = useAudioPlayerStatus(audioPlayer);
+  const {
+    activeChatSessionId,
+    appendMessages,
+    chatSessionSummaries,
+    messages,
+    renameChatSession,
+    setMessages,
+    startNewChat,
+    switchChatSession,
+  } = useChatSessions();
   const [activeTab, setActiveTab] = useState<MainTab>('materials');
   const [aiInput, setAiInput] = useState('');
-  const [messages, setMessages] = useState<ChatMessageItem[]>([]);
   const [isSending, setIsSending] = useState(false);
+  const [isChatSessionMenuOpen, setIsChatSessionMenuOpen] = useState(false);
+  const [editingChatSessionId, setEditingChatSessionId] = useState('');
+  const [editingChatTitle, setEditingChatTitle] = useState('');
   const transcriptListRef = useRef<FlatList>(null);
   const chatScrollRef = useRef<ScrollView>(null);
   const stopChatStreamRef = useRef<(() => void) | null>(null);
@@ -396,6 +474,7 @@ export default function WorkspaceScreen() {
   const [transcribingRecordingId, setTranscribingRecordingId] = useState<string | null>(null);
   const [transcriptionError, setTranscriptionError] = useState<string | null>(null);
   const [pdfPageCommand, setPdfPageCommand] = useState<PdfPageCommand | null>(null);
+  const [wordInsight, setWordInsight] = useState<WordInsight | null>(null);
   const emptyTranscriptAnimationRef = useRef<LottieView>(null);
   const transcriptionPreparingAnimationRef = useRef<LottieView>(null);
   const chatbotAnimationRef = useRef<LottieView>(null);
@@ -406,6 +485,8 @@ export default function WorkspaceScreen() {
   const playbackLocalCacheRef = useRef<Record<string, string>>({});
   const pendingAnnotationSessionRef = useRef<WorkspaceSessionNode | null>(null);
   const recordingPausedRef = useRef(false);
+  const wordInsightRequestRef = useRef(0);
+  const handledCitationParamRef = useRef('');
 
   const layout = useMemo(() => {
     const gap = clamp(width * 0.006, 8, 12);
@@ -1472,33 +1553,191 @@ export default function WorkspaceScreen() {
     });
   };
 
-  const handleCitationClick = useCallback((citation: any) => {
-    console.log('Citation clicked:', citation);
-  }, []);
+  const handleNewChat = () => {
+    if (isSending) return;
+    startNewChat();
+    setIsChatSessionMenuOpen(false);
+    setEditingChatSessionId('');
+    setAiInput('');
+  };
 
-  const handleSourceView = useCallback((citation: any) => {
-    // Navigate to the source - scroll to transcript or highlight material
-    const raw = citation.raw || citation;
-    if (raw.session_id) {
-      console.log('[SourceView] Navigate to session:', raw.session_id, 'recording:', raw.recording_id);
-      // If transcript type, try to find and scroll to the matching transcript line
-      if (raw.start_time != null) {
-        const startTime = Number(raw.start_time);
-        const targetLine = transcriptLines.find((line) => {
-          const lineStart = Number(line.startTime ?? line.start ?? 0);
-          return lineStart >= startTime;
-        });
-        if (targetLine) {
-          // Select the transcript line to trigger scroll-into-view
-          setSelectedTranscriptLineId(targetLine.id);
-          // Also start playback at this position if a recording is loaded
-          if (raw.recording_id) {
-            setSelectedRecordingId(raw.recording_id);
-          }
-        }
-      }
+  const handleChatSessionSelect = (nextSessionId: string) => {
+    if (isSending) return;
+    switchChatSession(nextSessionId);
+    setIsChatSessionMenuOpen(false);
+    setEditingChatSessionId('');
+  };
+
+  const startEditingChatTitle = (summary: { id: string; title: string }) => {
+    setEditingChatSessionId(summary.id);
+    setEditingChatTitle(summary.title);
+  };
+
+  const commitChatTitleEdit = () => {
+    if (!editingChatSessionId) return;
+    renameChatSession(editingChatSessionId, editingChatTitle);
+    setEditingChatSessionId('');
+    setEditingChatTitle('');
+  };
+
+  const cancelChatTitleEdit = () => {
+    setEditingChatSessionId('');
+    setEditingChatTitle('');
+  };
+
+  const handleCitationClick = useCallback(() => {}, []);
+
+  const findMaterialSourceForCitation = useCallback((raw: Record<string, unknown>) => {
+    const materialId = String(raw.material_id || raw.materialId || '');
+    const storedName = String(raw.stored_name || raw.storedName || '');
+    const materialName = String(raw.material_name || raw.file_title || raw.title || '');
+
+    return sessionSourceItems.find((source) => {
+      if (source.kind !== 'material') return false;
+      return Boolean(
+        (materialId && source.materialId === materialId) ||
+        (storedName && source.name.includes(storedName)) ||
+        (materialName && source.name === materialName),
+      );
+    });
+  }, [sessionSourceItems]);
+
+  const openMaterialCitationSource = useCallback(async (raw: Record<string, unknown>) => {
+    const source = findMaterialSourceForCitation(raw);
+    if (!source) {
+      Alert.alert('근거 자료를 열 수 없어요', '현재 세션에서 해당 PDF 자료를 찾지 못했습니다.');
+      return;
     }
-  }, [transcriptLines]);
+
+    await loadRemoteMaterialPdf(source);
+    setActiveTab('materials');
+    setIsSourceMenuOpen(false);
+    const page = Number(raw.page || 1);
+    setPdfPageCommand({ id: Date.now(), page: Number.isFinite(page) && page > 0 ? page : 1 });
+  }, [findMaterialSourceForCitation, loadRemoteMaterialPdf]);
+
+  const openTranscriptCitationSource = useCallback(async (raw: Record<string, unknown>) => {
+    const recordingId = String(raw.recording_id || raw.recordingId || '');
+    const targetRecordingIndex = remoteRecordings.findIndex(
+      (recording, index) => getRecordingResourceId(recording, index) === recordingId,
+    );
+    const targetRecording = targetRecordingIndex >= 0 ? remoteRecordings[targetRecordingIndex] : selectedTranscriptRecording;
+    const targetRecordingId = targetRecording
+      ? getRecordingResourceId(targetRecording, targetRecordingIndex >= 0 ? targetRecordingIndex : 0)
+      : recordingId || selectedRecordingId;
+
+    if (targetRecordingId) {
+      setSelectedRecordingId(targetRecordingId);
+      setPlaybackRecordingId(targetRecordingId);
+    }
+
+    const candidateLines = targetRecording ? buildTranscriptLines([targetRecording]) : transcriptLines;
+    const startTime = Number(raw.start_time ?? raw.startTime ?? 0);
+    const targetLine =
+      candidateLines.find((line) => {
+        const lineStart = typeof line.startSeconds === 'number' ? line.startSeconds : parsePlaybackTimeLabel(line.time);
+        return lineStart >= startTime;
+      }) ?? candidateLines[0];
+
+    if (targetLine) {
+      setSelectedTranscriptLineId(targetLine.id);
+    }
+
+    if (targetRecording && Number.isFinite(startTime)) {
+      await seekRecordingPlaybackTo(Math.max(0, startTime), {
+        play: true,
+        recording: targetRecording,
+        recordingId: targetRecordingId,
+      });
+    }
+  }, [
+    remoteRecordings,
+    selectedRecordingId,
+    selectedTranscriptRecording,
+    seekRecordingPlaybackTo,
+    transcriptLines,
+  ]);
+
+  const handleSourceView = useCallback(async (citation: NormalizedCitation | Record<string, unknown>) => {
+    const raw = ((citation as NormalizedCitation).raw || citation) as Record<string, unknown>;
+    const targetSessionId = String(raw.session_id || raw.sessionId || '');
+
+    if (targetSessionId && targetSessionId !== sessionId) {
+      router.push({
+        pathname: '/workspace',
+        params: {
+          citation: JSON.stringify(raw),
+          sessionId: targetSessionId,
+        },
+      });
+      return;
+    }
+
+    if (raw.source_type === 'material' || raw.material_id || raw.stored_name) {
+      await openMaterialCitationSource(raw);
+      return;
+    }
+
+    await openTranscriptCitationSource(raw);
+  }, [openMaterialCitationSource, openTranscriptCitationSource, router, sessionId]);
+
+  useEffect(() => {
+    if (!citationParam || !workspaceSession || handledCitationParamRef.current === citationParam) return;
+    const parsed = safeParseCitationParam(citationParam);
+    if (!parsed) return;
+    handledCitationParamRef.current = citationParam;
+    handleSourceView(parsed);
+  }, [citationParam, handleSourceView, workspaceSession]);
+
+  const handleTranscriptWordPress = useCallback(async (word: string, context: string) => {
+    const cleanWord = cleanSelectedWord(word);
+    if (!cleanWord) return;
+
+    const requestId = wordInsightRequestRef.current + 1;
+    wordInsightRequestRef.current = requestId;
+    setWordInsight({
+      desc: '',
+      error: '',
+      isLoading: true,
+      source: 'AI 분석 결과',
+      visible: true,
+      word: cleanWord,
+    });
+
+    try {
+      const result = await requestChatAnswer({
+        mode: 'word_explanation',
+        question: buildWordExplanationQuestion(cleanWord, context),
+        session_id: sessionId ?? null,
+      });
+
+      if (wordInsightRequestRef.current !== requestId) return;
+      setWordInsight({
+        desc: result.answer.trim() || 'AI 설명 결과가 비어 있습니다.',
+        error: '',
+        isLoading: false,
+        source: 'AI 분석 결과',
+        visible: true,
+        word: cleanWord,
+      });
+    } catch (error) {
+      if (wordInsightRequestRef.current !== requestId) return;
+      setWordInsight({
+        desc: 'AI 분석 결과를 불러오지 못했습니다.',
+        error: error instanceof Error ? error.message : 'AI 분석 결과를 불러오지 못했습니다.',
+        isLoading: false,
+        source: 'AI 분석 실패',
+        visible: true,
+        word: cleanWord,
+      });
+    }
+  }, [sessionId]);
+
+  const handleWordAskAi = () => {
+    if (!wordInsight?.word) return;
+    setAiInput(`"${wordInsight.word}"라는 단어를 강의 맥락에 맞춰 설명해줘.`);
+    setIsAiCollapsed(false);
+  };
 
   const sendMessage = useCallback(() => {
     const question = aiInput.trim();
@@ -1507,17 +1746,12 @@ export default function WorkspaceScreen() {
     setIsSending(true);
     setAiInput('');
     
-    setMessages((prev) => [
-      ...prev,
+    appendMessages([
       { role: 'user', text: question },
       { role: 'ai', text: '', phase: 'analyzing', statusText: '질문 분석 중', citations: [] }
     ]);
 
-    const sourceFilterIds = Array.from(selectedSourceIds);
-    const sourceFilterObj: Record<string, unknown> | null =
-      sourceFilterIds.length > 0
-        ? Object.fromEntries(sourceFilterIds.map((id) => [id, true]))
-        : null;
+    const sourceFilterObj = buildChatSourceFilter(selectedSourceIds, sessionSourceItems);
     
     stopChatStreamRef.current = startChatStream(
       {
@@ -1532,8 +1766,11 @@ export default function WorkspaceScreen() {
             const next = [...prev];
             const last = next[next.length - 1];
             if (last && last.role === 'ai') {
-              last.phase = phase;
-              last.statusText = message;
+              next[next.length - 1] = {
+                ...last,
+                phase,
+                statusText: message,
+              };
             }
             return next;
           });
@@ -1543,7 +1780,10 @@ export default function WorkspaceScreen() {
             const next = [...prev];
             const last = next[next.length - 1];
             if (last && last.role === 'ai') {
-              last.citations = citations;
+              next[next.length - 1] = {
+                ...last,
+                citations,
+              };
             }
             return next;
           });
@@ -1553,8 +1793,11 @@ export default function WorkspaceScreen() {
             const next = [...prev];
             const last = next[next.length - 1];
             if (last && last.role === 'ai') {
-              last.phase = 'answering';
-              last.text += token;
+              next[next.length - 1] = {
+                ...last,
+                phase: 'answering',
+                text: `${last.text || ''}${token}`,
+              };
             }
             return next;
           });
@@ -1564,8 +1807,11 @@ export default function WorkspaceScreen() {
             const next = [...prev];
             const last = next[next.length - 1];
             if (last && last.role === 'ai') {
-              last.phase = 'done';
-              last.text += `\n\n오류: ${error}`;
+              next[next.length - 1] = {
+                ...last,
+                phase: 'done',
+                text: `${last.text || ''}\n\n오류: ${error}`,
+              };
             }
             return next;
           });
@@ -1576,7 +1822,10 @@ export default function WorkspaceScreen() {
             const next = [...prev];
             const last = next[next.length - 1];
             if (last && last.role === 'ai') {
-              last.phase = 'done';
+              next[next.length - 1] = {
+                ...last,
+                phase: 'done',
+              };
             }
             return next;
           });
@@ -1584,7 +1833,7 @@ export default function WorkspaceScreen() {
         }
       }
     )?.abort;
-  }, [aiInput, isSending, sessionId, selectedSourceIds]);
+  }, [aiInput, appendMessages, isSending, selectedSourceIds, sessionId, sessionSourceItems, setMessages]);
 
   useEffect(() => {
     return () => {
@@ -1717,6 +1966,14 @@ export default function WorkspaceScreen() {
               </Pressable>
             </View>
 
+            {wordInsight?.visible ? (
+              <WordInsightCard
+                insight={wordInsight}
+                onAskAi={handleWordAskAi}
+                onClose={() => setWordInsight((current) => current ? { ...current, visible: false } : current)}
+              />
+            ) : null}
+
             {sessionLoading ? (
               <View style={styles.emptyScriptState}>
                 <ActivityIndicator color="#1D1D1F" />
@@ -1768,7 +2025,17 @@ export default function WorkspaceScreen() {
                         style={styles.transcriptBubble}>
                         <View style={styles.transcriptTextBlock}>
                           <Text style={[styles.transcriptText, isActiveLine && styles.transcriptTextActive]}>
-                            {line.text}
+                            {splitTranscriptTextTokens(line.text).map((token) => (
+                              token.isWord ? (
+                                <Text
+                                  key={token.id}
+                                  onPress={() => handleTranscriptWordPress(token.value, line.text)}
+                                  style={[styles.transcriptWordText, isActiveLine && styles.transcriptWordTextActive]}
+                                  suppressHighlighting>
+                                  {token.value}
+                                </Text>
+                              ) : token.value
+                            ))}
                           </Text>
                         </View>
                       </Pressable>
@@ -1962,6 +2229,86 @@ export default function WorkspaceScreen() {
               styles.aiPanel,
               { borderRadius: layout.radius, width: currentAiPanelWidth },
             ]}>
+              <View style={styles.chatSessionToolbar}>
+                <Pressable
+                  disabled={isSending}
+                  onPress={() => setIsChatSessionMenuOpen((value) => !value)}
+                  style={styles.chatSessionToggle}>
+                  <MaterialIcons name="forum" size={17} color="#64748B" />
+                  <Text numberOfLines={1} style={styles.chatSessionToggleText}>
+                    {chatSessionSummaries.find((session) => session.id === activeChatSessionId)?.title || '새 채팅'}
+                  </Text>
+                  <MaterialIcons
+                    name={isChatSessionMenuOpen ? 'expand-less' : 'expand-more'}
+                    size={18}
+                    color="#64748B"
+                  />
+                </Pressable>
+                <Pressable disabled={isSending} onPress={handleNewChat} style={styles.chatSessionNewButton}>
+                  <MaterialIcons name="add" size={17} color="#FFFFFF" />
+                  <Text style={styles.chatSessionNewText}>새 채팅</Text>
+                </Pressable>
+              </View>
+
+              {isChatSessionMenuOpen ? (
+                <View style={styles.chatSessionMenu}>
+                  <Pressable disabled={isSending} onPress={handleNewChat} style={styles.chatSessionMenuNew}>
+                    <MaterialIcons name="add-comment" size={17} color="#1D1D1F" />
+                    <Text style={styles.chatSessionMenuNewText}>새로운 채팅 시작</Text>
+                  </Pressable>
+                  <ScrollView
+                    bounces={false}
+                    showsVerticalScrollIndicator={false}
+                    style={styles.chatSessionMenuScroll}>
+                    {chatSessionSummaries.map((session) => (
+                      <View
+                        key={session.id}
+                        style={[
+                          styles.chatSessionMenuItem,
+                          session.id === activeChatSessionId && styles.chatSessionMenuItemActive,
+                        ]}>
+                        {editingChatSessionId === session.id ? (
+                          <TextInput
+                            autoFocus
+                            maxLength={40}
+                            onBlur={commitChatTitleEdit}
+                            onChangeText={setEditingChatTitle}
+                            onSubmitEditing={commitChatTitleEdit}
+                            onKeyPress={({ nativeEvent }) => {
+                              if (nativeEvent.key === 'Escape') cancelChatTitleEdit();
+                            }}
+                            style={styles.chatSessionTitleInput}
+                            value={editingChatTitle}
+                          />
+                        ) : (
+                          <Pressable
+                            disabled={isSending}
+                            onPress={() => handleChatSessionSelect(session.id)}
+                            style={styles.chatSessionTitleButton}>
+                            <MaterialIcons name="chat-bubble" size={15} color="#94A3B8" />
+                            <Text numberOfLines={1} style={styles.chatSessionTitleText}>{session.title}</Text>
+                          </Pressable>
+                        )}
+                        <Pressable
+                          disabled={isSending}
+                          onPress={() =>
+                            editingChatSessionId === session.id
+                              ? commitChatTitleEdit()
+                              : startEditingChatTitle(session)
+                          }
+                          style={styles.chatSessionEditButton}>
+                          <MaterialIcons
+                            name={editingChatSessionId === session.id ? 'check' : 'edit'}
+                            size={15}
+                            color="#64748B"
+                          />
+                        </Pressable>
+                      </View>
+                    ))}
+                  </ScrollView>
+                </View>
+              ) : null}
+
               <View style={{ flex: 1, position: 'relative' }}>
                 {messages.length === 0 ? (
                   <View style={styles.aiCenter}>
@@ -2055,6 +2402,51 @@ function AiPanelIcon() {
     <View style={styles.aiPanelIconFrame}>
       <View style={styles.aiPanelIconBar} />
       <View style={styles.aiPanelIconChevron} />
+    </View>
+  );
+}
+
+function WordInsightCard({
+  insight,
+  onAskAi,
+  onClose,
+}: {
+  insight: WordInsight;
+  onAskAi: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <View style={styles.wordInsightCard}>
+      <View style={styles.wordInsightHeader}>
+        <View style={styles.wordInsightIcon}>
+          <MaterialIcons name="auto-awesome" size={15} color="#2563EB" />
+        </View>
+        <View style={styles.wordInsightTitleWrap}>
+          <Text numberOfLines={1} style={styles.wordInsightWord}>{insight.word}</Text>
+          <Text style={styles.wordInsightSource}>{insight.source}</Text>
+        </View>
+        <Pressable onPress={onClose} style={styles.wordInsightCloseButton}>
+          <MaterialIcons name="close" size={16} color="#64748B" />
+        </Pressable>
+      </View>
+
+      <View style={styles.wordInsightBody}>
+        {insight.isLoading ? (
+          <View style={styles.wordInsightLoading}>
+            <ActivityIndicator color="#2563EB" size="small" />
+            <Text style={styles.wordInsightText}>단어 의미를 찾는 중...</Text>
+          </View>
+        ) : (
+          <Text style={[styles.wordInsightText, insight.error && styles.wordInsightErrorText]}>
+            {insight.desc}
+          </Text>
+        )}
+      </View>
+
+      <Pressable disabled={insight.isLoading} onPress={onAskAi} style={styles.wordInsightAskButton}>
+        <MaterialIcons name="chat" size={14} color="#FFFFFF" />
+        <Text style={styles.wordInsightAskText}>AI 채팅에 묻기</Text>
+      </Pressable>
     </View>
   );
 }
@@ -2437,14 +2829,25 @@ function MaterialsPanel({
     );
   };
 
-  const scrollPdfPage = (direction: PdfPageCommand['direction']) => {
+  const scrollPdfPage = (direction: 'next' | 'previous') => {
     pdfWebViewRef.current?.injectJavaScript(
       `window.scrollPdfPage && window.scrollPdfPage(${JSON.stringify(direction)}); true;`,
     );
   };
 
+  const scrollPdfToPage = (page: number) => {
+    pdfWebViewRef.current?.injectJavaScript(
+      `window.scrollPdfToPage && window.scrollPdfToPage(${JSON.stringify(page)}); true;`,
+    );
+  };
+
   useEffect(() => {
     if (!pageCommand || !currentPdf) return;
+    if ('page' in pageCommand) {
+      scrollPdfToPage(pageCommand.page);
+      return;
+    }
+
     scrollPdfPage(pageCommand.direction);
   }, [currentPdf, pageCommand]);
 
@@ -3103,6 +3506,93 @@ const styles = StyleSheet.create({
     borderRadius: 6,
     color: '#111827',
     overflow: 'hidden',
+  },
+  transcriptWordText: {
+    color: '#444B55',
+    textDecorationLine: 'none',
+  },
+  transcriptWordTextActive: {
+    color: '#111827',
+  },
+  wordInsightCard: {
+    backgroundColor: '#F8FBFF',
+    borderBottomColor: '#E4ECF8',
+    borderBottomWidth: 1,
+    gap: 8,
+    paddingHorizontal: 18,
+    paddingVertical: 13,
+  },
+  wordInsightHeader: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 9,
+  },
+  wordInsightIcon: {
+    alignItems: 'center',
+    backgroundColor: '#DBEAFE',
+    borderRadius: 8,
+    height: 28,
+    justifyContent: 'center',
+    width: 28,
+  },
+  wordInsightTitleWrap: {
+    flex: 1,
+    minWidth: 0,
+  },
+  wordInsightWord: {
+    color: '#0F172A',
+    fontFamily: FontFamily.extraBold,
+    fontSize: 14,
+    fontWeight: 'normal',
+  },
+  wordInsightSource: {
+    color: '#64748B',
+    fontFamily: FontFamily.bold,
+    fontSize: 11,
+    fontWeight: 'normal',
+    marginTop: 1,
+  },
+  wordInsightCloseButton: {
+    alignItems: 'center',
+    borderRadius: 8,
+    height: 30,
+    justifyContent: 'center',
+    width: 30,
+  },
+  wordInsightBody: {
+    paddingLeft: 37,
+  },
+  wordInsightLoading: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 8,
+  },
+  wordInsightText: {
+    color: '#334155',
+    fontFamily: FontFamily.medium,
+    fontSize: 13,
+    fontWeight: 'normal',
+    lineHeight: 19,
+  },
+  wordInsightErrorText: {
+    color: '#DC2626',
+  },
+  wordInsightAskButton: {
+    alignItems: 'center',
+    alignSelf: 'flex-start',
+    backgroundColor: '#2563EB',
+    borderRadius: 12,
+    flexDirection: 'row',
+    gap: 6,
+    height: 32,
+    marginLeft: 37,
+    paddingHorizontal: 11,
+  },
+  wordInsightAskText: {
+    color: '#FFFFFF',
+    fontFamily: FontFamily.extraBold,
+    fontSize: 12,
+    fontWeight: 'normal',
   },
   scriptResizeHandle: {
     alignItems: 'center',
@@ -4063,6 +4553,133 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFFFFF',
     overflow: 'hidden',
     position: 'relative',
+  },
+  chatSessionToolbar: {
+    alignItems: 'center',
+    borderBottomColor: '#EEF2F7',
+    borderBottomWidth: 1,
+    flexDirection: 'row',
+    gap: 8,
+    minHeight: 52,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    zIndex: 12,
+  },
+  chatSessionToggle: {
+    alignItems: 'center',
+    backgroundColor: '#F8FAFC',
+    borderColor: '#E2E8F0',
+    borderRadius: 14,
+    borderWidth: 1,
+    flex: 1,
+    flexDirection: 'row',
+    gap: 6,
+    height: 36,
+    minWidth: 0,
+    paddingHorizontal: 10,
+  },
+  chatSessionToggleText: {
+    color: '#1E293B',
+    flex: 1,
+    fontFamily: FontFamily.extraBold,
+    fontSize: 12,
+    fontWeight: 'normal',
+  },
+  chatSessionNewButton: {
+    alignItems: 'center',
+    backgroundColor: '#111318',
+    borderRadius: 14,
+    flexDirection: 'row',
+    gap: 4,
+    height: 36,
+    justifyContent: 'center',
+    paddingHorizontal: 10,
+  },
+  chatSessionNewText: {
+    color: '#FFFFFF',
+    fontFamily: FontFamily.extraBold,
+    fontSize: 12,
+    fontWeight: 'normal',
+  },
+  chatSessionMenu: {
+    backgroundColor: '#FFFFFF',
+    borderColor: '#E2E8F0',
+    borderRadius: 14,
+    borderWidth: 1,
+    left: 12,
+    maxHeight: 280,
+    padding: 8,
+    position: 'absolute',
+    right: 12,
+    shadowColor: '#101828',
+    shadowOffset: { height: 14, width: 0 },
+    shadowOpacity: 0.14,
+    shadowRadius: 24,
+    top: 56,
+    zIndex: 40,
+  },
+  chatSessionMenuNew: {
+    alignItems: 'center',
+    borderRadius: 10,
+    flexDirection: 'row',
+    gap: 8,
+    height: 40,
+    paddingHorizontal: 10,
+  },
+  chatSessionMenuNewText: {
+    color: '#1D1D1F',
+    fontFamily: FontFamily.extraBold,
+    fontSize: 13,
+    fontWeight: 'normal',
+  },
+  chatSessionMenuScroll: {
+    maxHeight: 220,
+  },
+  chatSessionMenuItem: {
+    alignItems: 'center',
+    borderRadius: 11,
+    flexDirection: 'row',
+    gap: 6,
+    minHeight: 42,
+    paddingHorizontal: 8,
+  },
+  chatSessionMenuItemActive: {
+    backgroundColor: '#EEF5FF',
+  },
+  chatSessionTitleInput: {
+    backgroundColor: '#FFFFFF',
+    borderColor: '#C7D2FE',
+    borderRadius: 9,
+    borderWidth: 1,
+    color: '#111827',
+    flex: 1,
+    fontFamily: FontFamily.extraBold,
+    fontSize: 13,
+    fontWeight: 'normal',
+    height: 32,
+    paddingHorizontal: 9,
+  },
+  chatSessionTitleButton: {
+    alignItems: 'center',
+    flex: 1,
+    flexDirection: 'row',
+    gap: 8,
+    minHeight: 36,
+    minWidth: 0,
+  },
+  chatSessionTitleText: {
+    color: '#334155',
+    flex: 1,
+    fontFamily: FontFamily.bold,
+    fontSize: 13,
+    fontWeight: 'normal',
+  },
+  chatSessionEditButton: {
+    alignItems: 'center',
+    borderRadius: 9,
+    height: 32,
+    justifyContent: 'center',
+    width: 32,
   },
   aiResizeHandle: {
     alignItems: 'center',

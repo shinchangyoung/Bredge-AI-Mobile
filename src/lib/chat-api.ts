@@ -4,6 +4,7 @@ import { getWorkspaceApiBaseUrl } from '../../workspace-api';
 export type ChatPayload = {
   question: string;
   is_thinking?: boolean;
+  mode?: string | null;
   session_id?: string | null;
   source_filter?: Record<string, unknown> | null;
 };
@@ -38,6 +39,7 @@ export function startChatStream(
     body: JSON.stringify({
       question: payload.question,
       is_thinking: payload.is_thinking ?? false,
+      mode: payload.mode || null,
       session_id: payload.session_id || null,
       source_filter: payload.source_filter || null,
     }),
@@ -84,5 +86,46 @@ export function startChatStream(
 
   return {
     abort: () => es.close(),
+  };
+}
+
+export async function requestChatAnswer(payload: ChatPayload) {
+  const response = await fetch(`${getWorkspaceApiBaseUrl()}/chat`, {
+    body: JSON.stringify({
+      question: payload.question,
+      is_thinking: payload.is_thinking ?? false,
+      mode: payload.mode || null,
+      session_id: payload.session_id || null,
+      source_filter: payload.source_filter || null,
+    }),
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    method: 'POST',
+  });
+
+  const raw = await response.text();
+  let result: Record<string, unknown> = {};
+
+  try {
+    result = raw ? JSON.parse(raw) : {};
+  } catch {
+    result = { answer: raw };
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      typeof result.error === 'string'
+        ? result.error
+        : typeof result.detail === 'string'
+          ? result.detail
+          : `서버 응답 오류 (${response.status})`,
+    );
+  }
+
+  return {
+    answer: String(result.answer || ''),
+    citations: Array.isArray(result.citations) ? result.citations : [],
+    thinking: String(result.thinking || ''),
   };
 }
