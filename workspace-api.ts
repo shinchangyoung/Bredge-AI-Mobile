@@ -100,6 +100,27 @@ export type WorkspaceUploadFile = {
   uri: string;
 };
 
+export type WorkspaceScheduleItem = {
+  calendar_flag?: boolean | null;
+  course_title?: string | null;
+  created_at?: string | null;
+  description?: string | null;
+  due_date?: string | null;
+  event_type?: string | null;
+  notion_page_id?: string | null;
+  recording_id?: string | null;
+  schedule_id: string;
+  session_id?: string | null;
+  session_title?: string | null;
+  source_end_time?: number | null;
+  source_start_time?: number | null;
+  source_text?: string | null;
+  status?: string | null;
+  title?: string | null;
+  transcript_id?: string | null;
+  updated_at?: string | null;
+};
+
 export type UploadWorkspaceRecordingOptions = {
   durationSeconds?: number;
   title?: string;
@@ -144,6 +165,12 @@ async function parseWorkspaceResponse(response: Response, fallbackMessage: strin
 
 async function requestWorkspaceJson(endpoint: string, fallbackMessage: string, init?: RequestInit) {
   const response = await fetch(`${API_BASE_URL}/workspace/${endpoint}`, init);
+  return parseWorkspaceResponse(response, fallbackMessage);
+}
+
+async function requestScheduleJson(endpoint: string, fallbackMessage: string, init?: RequestInit) {
+  const normalizedEndpoint = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
+  const response = await fetch(`${API_BASE_URL}/schedule${normalizedEndpoint}`, init);
   return parseWorkspaceResponse(response, fallbackMessage);
 }
 
@@ -259,6 +286,30 @@ export async function createWorkspaceSession(data: {
   }>;
 }
 
+export async function getWorkspaceSchedules() {
+  const result = await requestScheduleJson('/', '일정 목록을 불러오지 못했습니다.');
+  if (!Array.isArray(result.schedules)) {
+    throw new Error('일정 목록을 불러오지 못했습니다.');
+  }
+
+  return result.schedules as WorkspaceScheduleItem[];
+}
+
+export async function confirmWorkspaceSchedule(scheduleId: string) {
+  return requestScheduleJson(
+    `/${encodeURIComponent(scheduleId)}/confirm`,
+    '일정을 확정하지 못했습니다.',
+    { method: 'PUT' },
+  );
+}
+
+export async function ignoreWorkspaceSchedule(scheduleId: string) {
+  return requestScheduleJson(
+    `/${encodeURIComponent(scheduleId)}/ignore`,
+    '일정을 무시하지 못했습니다.',
+    { method: 'PUT' },
+  );
+}
 
 export function getWorkspaceAssetUrl(path?: string | null) {
   if (!path) return undefined;
